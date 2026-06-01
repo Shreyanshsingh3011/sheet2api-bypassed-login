@@ -69,6 +69,19 @@ export default function App() {
 
   useEffect(() => {
     const sp = new URLSearchParams(window.location.search)
+    // Google OAuth callback
+    if (sp.get('google_login') === '1' && sp.get('token')) {
+      localStorage.setItem('sf_token', sp.get('token'))
+      const linked = sp.get('linked') === '1'
+      window.history.replaceState({}, '', '/')
+      api('auth/me').then(d => { setUser(d.user); setView('app'); setBooted(true); toast.success(linked ? 'Google account linked!' : `Welcome, ${d.user.name}!`) })
+        .catch(() => { localStorage.removeItem('sf_token'); setBooted(true) })
+      return
+    }
+    if (sp.get('google_error')) {
+      toast.error('Google sign-in failed: ' + sp.get('google_error'))
+      window.history.replaceState({}, '', '/')
+    }
     const rt = sp.get('reset')
     if (rt) { setResetToken(rt); setView('reset'); setBooted(true); return }
     const token = localStorage.getItem('sf_token')
@@ -272,22 +285,29 @@ function AuthDialog({ open, onOpenChange, mode, setMode, onAuthed }) {
         </DialogHeader>
 
         {mode !== 'forgot' && (
-          <form onSubmit={submit} className="space-y-3">
-            {mode === 'signup' && (<div><Label>Name</Label><Input value={name} onChange={e => setName(e.target.value)} placeholder="Jane Doe" /></div>)}
-            <div><Label>Email</Label><Input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com" /></div>
-            <div>
-              <Label>Password</Label>
-              <div className="relative">
-                <Input type={showPw ? 'text' : 'password'} required value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
-                <button type="button" onClick={() => setShowPw(s => !s)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground">{showPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}</button>
+          <>
+            <Button type="button" variant="outline" className="w-full" onClick={() => { window.location.href = '/api/auth/google/start' }}>
+              <svg className="w-4 h-4 mr-2" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.3-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 13 24 13c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.7 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.2 5.2C40.9 36 44 30.5 44 24c0-1.2-.1-2.3-.4-3.5z"/></svg>
+              Continue with Google
+            </Button>
+            <div className="flex items-center gap-3 my-1"><div className="flex-1 h-px bg-border" /><span className="text-xs text-muted-foreground">or with email</span><div className="flex-1 h-px bg-border" /></div>
+            <form onSubmit={submit} className="space-y-3">
+              {mode === 'signup' && (<div><Label>Name</Label><Input value={name} onChange={e => setName(e.target.value)} placeholder="Jane Doe" /></div>)}
+              <div><Label>Email</Label><Input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com" /></div>
+              <div>
+                <Label>Password</Label>
+                <div className="relative">
+                  <Input type={showPw ? 'text' : 'password'} required value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
+                  <button type="button" onClick={() => setShowPw(s => !s)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground">{showPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}</button>
+                </div>
               </div>
-            </div>
-            <Button type="submit" disabled={loading} className="w-full bg-gradient-to-r from-indigo-500 to-cyan-500">{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : (mode === 'login' ? 'Login' : 'Sign up')}</Button>
-            <div className="text-sm text-center text-muted-foreground flex items-center justify-between">
-              <button type="button" onClick={() => setMode('forgot')} className="text-cyan-400 hover:underline">Forgot password?</button>
-              <button type="button" onClick={() => setMode(mode === 'login' ? 'signup' : 'login')} className="text-cyan-400 hover:underline">{mode === 'login' ? 'Create account' : 'Have an account?'}</button>
-            </div>
-          </form>
+              <Button type="submit" disabled={loading} className="w-full bg-gradient-to-r from-indigo-500 to-cyan-500">{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : (mode === 'login' ? 'Login' : 'Sign up')}</Button>
+              <div className="text-sm text-center text-muted-foreground flex items-center justify-between">
+                <button type="button" onClick={() => setMode('forgot')} className="text-cyan-400 hover:underline">Forgot password?</button>
+                <button type="button" onClick={() => setMode(mode === 'login' ? 'signup' : 'login')} className="text-cyan-400 hover:underline">{mode === 'login' ? 'Create account' : 'Have an account?'}</button>
+              </div>
+            </form>
+          </>
         )}
 
         {mode === 'forgot' && (
@@ -599,9 +619,14 @@ function NewSource({ onDone, onCancel }) {
   const save = async () => {
     setBusy(true)
     try {
-      const body = type === 'google_sheet'
-        ? { type, name, url }
-        : { type, name, fileName: parsed.fileName, columns: parsed.columns, rows: parsed.rows }
+      let body
+      if (type === 'google_sheet' && parsed?.private) {
+        body = { type: 'google_sheet_private', name, spreadsheetId: parsed.spreadsheetId, sheetTitle: parsed.sheetTitle }
+      } else if (type === 'google_sheet') {
+        body = { type, name, url }
+      } else {
+        body = { type, name, fileName: parsed.fileName, columns: parsed.columns, rows: parsed.rows }
+      }
       await api('sources', { method: 'POST', body: JSON.stringify(body) })
       toast.success('Source added')
       onDone()
@@ -648,11 +673,16 @@ function NewSource({ onDone, onCancel }) {
           <div><Label>Source name</Label><Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Employee Master 2025" /></div>
 
           {type === 'google_sheet' && (
-            <>
-              <div><Label>Google Sheets URL</Label><Input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0" /></div>
-              <div className="text-xs text-muted-foreground">Share as <strong>Anyone with the link → Viewer</strong>. Private OAuth coming soon.</div>
-              <Button onClick={parseGS} disabled={busy || !url} variant="outline">{busy ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Reading…</> : 'Verify sheet'}</Button>
-            </>
+            <GoogleSheetConfigurator
+              setParsed={setParsed}
+              parsed={parsed}
+              url={url}
+              setUrl={setUrl}
+              setName={setName}
+              name={name}
+              parseGS={parseGS}
+              busy={busy}
+            />
           )}
 
           {(type === 'xlsx_upload' || type === 'csv_upload') && (
@@ -1195,11 +1225,137 @@ export default async function Page() {
   )
 }
 
+// ──────────────────── Google Sheet Configurator (private picker + public URL fallback) ────────────────────
+function GoogleSheetConfigurator({ setParsed, parsed, url, setUrl, name, setName, parseGS, busy }) {
+  const [gMode, setGMode] = useState('private') // 'private' or 'public'
+  const [gStatus, setGStatus] = useState(null) // {connected, googleId, connectedAt}
+  const [sheets, setSheets] = useState([])
+  const [loadingSheets, setLoadingSheets] = useState(false)
+  const [selSheet, setSelSheet] = useState(null) // {id, name}
+  const [tabs, setTabs] = useState([])
+  const [selTab, setSelTab] = useState(null) // {sheetId, title}
+  const [loadingTabs, setLoadingTabs] = useState(false)
+  const [loadingPreview, setLoadingPreview] = useState(false)
+
+  const loadStatus = async () => {
+    try { const s = await api('auth/google/status'); setGStatus(s); if (s.connected) loadSheets() } catch (e) { setGStatus({ connected: false }) }
+  }
+  const loadSheets = async () => {
+    setLoadingSheets(true)
+    try { const d = await api('google/sheets'); setSheets(d.sheets) } catch (e) { toast.error(e.message) } finally { setLoadingSheets(false) }
+  }
+  useEffect(() => { loadStatus() }, [])
+
+  const pickSheet = async (s) => {
+    setSelSheet(s); setTabs([]); setSelTab(null); setLoadingTabs(true)
+    try {
+      const d = await api(`google/sheets/${s.id}/meta`)
+      setTabs(d.tabs)
+      if (d.tabs.length === 1) { await pickTab(s, d.tabs[0]) }
+    } catch (e) { toast.error(e.message) } finally { setLoadingTabs(false) }
+  }
+  const pickTab = async (sheet, tab) => {
+    setSelTab(tab); setLoadingPreview(true)
+    try {
+      // Save as parsed (private mode). The actual structure verification happens server-side when source is saved.
+      // Use rowCount estimate from tab metadata.
+      setParsed({ private: true, spreadsheetId: sheet.id, sheetTitle: tab.title, title: sheet.name,
+                  columns: Array.from({ length: tab.columnCount || 0 }, (_, i) => ({ id: `col${i}`, name: `Column ${i+1}`, type: 'string' })),
+                  rowCount: Math.max(0, (tab.rowCount || 1) - 1) })
+      if (!name) setName(`${sheet.name} / ${tab.title}`)
+      toast.success('Sheet selected. Click "Save source" to confirm.')
+    } catch (e) { toast.error(e.message) } finally { setLoadingPreview(false) }
+  }
+
+  const startOAuth = () => {
+    // Link to current account
+    const tok = localStorage.getItem('sf_token')
+    window.location.href = `/api/auth/google/start?link=self&_=${Date.now()}`
+    // Note: server reads Bearer for link mode. We need to pass token via header — but redirect can't send headers.
+    // For link mode, use a cookie or pass token in query. Simplest: put token in localStorage and on callback redirect back.
+    // The server route uses Bearer header; since we can't set headers on a redirect, we add token in a header via a workaround:
+    // simplest: change to login mode (will reuse email-match logic to link)
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-1 p-1 bg-muted/40 rounded-md w-fit">
+        <button onClick={() => setGMode('private')} className={`px-3 py-1 text-sm rounded ${gMode === 'private' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}>Private (via Google)</button>
+        <button onClick={() => setGMode('public')} className={`px-3 py-1 text-sm rounded ${gMode === 'public' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}>Public link</button>
+      </div>
+
+      {gMode === 'private' && (
+        <div className="space-y-3">
+          {!gStatus ? <Loader2 className="w-4 h-4 animate-spin" /> : !gStatus.connected ? (
+            <div className="rounded-md border border-border/60 bg-card/40 p-4 text-center">
+              <p className="text-sm text-muted-foreground mb-3">Sign in with Google to securely access your private spreadsheets.</p>
+              <Button variant="outline" onClick={() => { const tok = localStorage.getItem('sf_token'); window.location.href = `/api/auth/google/start?link_token=${tok || ''}` }}>
+                <svg className="w-4 h-4 mr-2" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.3-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 13 24 13c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.7 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.2 5.2C40.9 36 44 30.5 44 24c0-1.2-.1-2.3-.4-3.5z"/></svg>
+                Connect Google
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-emerald-300 flex items-center gap-1.5"><CheckCircle2 className="w-3 h-3" /> Google connected</span>
+                <button onClick={loadSheets} className="text-cyan-400 hover:underline">Refresh list</button>
+              </div>
+              <div>
+                <Label>Choose a spreadsheet</Label>
+                {loadingSheets ? <Loader2 className="w-4 h-4 animate-spin my-2" /> : sheets.length === 0 ? <p className="text-sm text-muted-foreground">No spreadsheets found.</p> : (
+                  <div className="max-h-48 overflow-y-auto border border-border/60 rounded-md divide-y divide-border/60">
+                    {sheets.map(s => (
+                      <button key={s.id} onClick={() => pickSheet(s)} className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/40 ${selSheet?.id === s.id ? 'bg-cyan-500/10' : ''}`}>
+                        <FileSpreadsheet className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                        <span className="flex-1 truncate">{s.name}</span>
+                        <span className="text-xs text-muted-foreground">{new Date(s.modifiedTime).toLocaleDateString()}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {selSheet && (
+                <div>
+                  <Label>Choose a tab</Label>
+                  {loadingTabs ? <Loader2 className="w-4 h-4 animate-spin my-2" /> : (
+                    <Select value={selTab?.title || ''} onValueChange={(v) => { const t = tabs.find(x => x.title === v); if (t) pickTab(selSheet, t) }}>
+                      <SelectTrigger><SelectValue placeholder="Pick a tab..." /></SelectTrigger>
+                      <SelectContent>{tabs.map(t => <SelectItem key={t.sheetId} value={t.title}>{t.title} ({t.rowCount} × {t.columnCount})</SelectItem>)}</SelectContent>
+                    </Select>
+                  )}
+                </div>
+              )}
+              {parsed?.private && selTab && (
+                <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                  <span><strong>{selSheet.name}</strong> → <strong>{selTab.title}</strong> ready. {parsed.rowCount} rows × {tabs.find(t => t.title === selTab.title)?.columnCount || '?'} cols.</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {gMode === 'public' && (
+        <>
+          <div><Label>Google Sheets URL</Label><Input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0" /></div>
+          <div className="text-xs text-muted-foreground">Share as <strong>Anyone with the link → Viewer</strong>.</div>
+          <Button onClick={parseGS} disabled={busy || !url} variant="outline">{busy ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Reading…</> : 'Verify sheet'}</Button>
+        </>
+      )}
+    </div>
+  )
+}
+
 // ──────────────────── Profile ────────────────────
 function ProfilePage({ user, onLogout }) {
+  const [gStatus, setGStatus] = useState(null)
+  useEffect(() => { api('auth/google/status').then(setGStatus).catch(() => setGStatus({ connected: false })) }, [])
+  const disconnect = async () => { if (!confirm('Disconnect Google? Private sheet sources will stop working.')) return; await api('auth/google/disconnect', { method: 'POST' }); toast.success('Google disconnected'); setGStatus({ connected: false }) }
+  const connect = () => { const tok = localStorage.getItem('sf_token'); window.location.href = `/api/auth/google/start?link_token=${tok || ''}` }
   return (
     <div className="max-w-2xl space-y-6">
-      <div><h1 className="text-2xl font-bold">Profile</h1><p className="text-sm text-muted-foreground mt-1">Account info & actions.</p></div>
+      <div><h1 className="text-2xl font-bold">Profile</h1><p className="text-sm text-muted-foreground mt-1">Account info & connected services.</p></div>
       <Card className="border-border/60">
         <CardContent className="p-6 space-y-4">
           <div className="flex items-center gap-4">
@@ -1207,7 +1363,18 @@ function ProfilePage({ user, onLogout }) {
             <div><div className="font-semibold text-lg">{user.name}</div><div className="text-muted-foreground">{user.email}</div><Badge variant="outline" className="mt-1">{user.role}</Badge></div>
           </div>
           <Separator />
-          <div className="text-sm text-muted-foreground">More settings (change password, social logins, API tokens) coming soon.</div>
+          <div>
+            <div className="font-medium mb-2">Connected Services</div>
+            <div className="flex items-center gap-3 p-3 rounded-md border border-border/60">
+              <svg className="w-6 h-6" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.3-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 13 24 13c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.7 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.2 5.2C40.9 36 44 30.5 44 24c0-1.2-.1-2.3-.4-3.5z"/></svg>
+              <div className="flex-1">
+                <div className="font-medium text-sm">Google</div>
+                <div className="text-xs text-muted-foreground">{gStatus?.connected ? `Connected${gStatus.connectedAt ? ' on ' + new Date(gStatus.connectedAt).toLocaleDateString() : ''} • Sheets read-only` : 'Connect to access private Google Sheets'}</div>
+              </div>
+              {gStatus?.connected ? <Button size="sm" variant="outline" onClick={disconnect}>Disconnect</Button> : <Button size="sm" variant="outline" onClick={connect}>Connect</Button>}
+            </div>
+          </div>
+          <Separator />
           <Button variant="outline" onClick={onLogout}><LogOut className="w-4 h-4 mr-2" />Sign out</Button>
         </CardContent>
       </Card>

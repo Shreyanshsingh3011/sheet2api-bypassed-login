@@ -8,6 +8,31 @@ import crypto from 'crypto'
 const MONGO_URL = process.env.MONGO_URL
 const DB_NAME = process.env.DB_NAME || 'sheetflow_ai'
 const JWT_SECRET = process.env.JWT_SECRET || 'sheetflow_dev_secret'
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI
+const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || ''
+
+// AES-256-GCM encryption for OAuth tokens at rest
+const ENC_KEY = crypto.createHash('sha256').update(JWT_SECRET + '|sf_enc').digest()
+function encryptStr(plaintext) {
+  if (plaintext == null) return null
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENC_KEY, iv)
+  const enc = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return Buffer.concat([iv, tag, enc]).toString('base64')
+}
+function decryptStr(b64) {
+  if (!b64) return null
+  try {
+    const buf = Buffer.from(b64, 'base64')
+    const iv = buf.subarray(0, 12), tag = buf.subarray(12, 28), enc = buf.subarray(28)
+    const decipher = crypto.createDecipheriv('aes-256-gcm', ENC_KEY, iv)
+    decipher.setAuthTag(tag)
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8')
+  } catch (e) { return null }
+}
 
 let cachedClient = null
 async function getDb() {
@@ -291,6 +316,10 @@ async function getCachedOrLive(db, connector, source) {
   if (source.type === 'google_sheet') {
     const g = await fetchGvizJson(source.sheetId, source.gid || '0')
     const p = parseGviz(g); columns = p.columns; rows = p.rows
+  } else if (source.type === 'google_sheet_private') {
+    const at = await getValidGoogleAccessToken(db, source.userId)
+    const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle)
+    columns = sd.columns; rows = sd.rows
   } else {
     columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
   }
@@ -300,7 +329,114 @@ async function getCachedOrLive(db, connector, source) {
   return { columns, rows, fromCache: false }
 }
 
-const stripDoc = d => { if (!d) return d; const { _id, passwordHash, resetToken, resetExpires, ...rest } = d; return rest }
+const stripDoc = d => { if (!d) return d; const { _id, passwordHash, resetToken, resetExpires, googleAccessToken, googleRefreshToken, googleTokenExpiry, ...rest } = d; return rest }
+
+// ───────── Google OAuth + Sheets/Drive ─────────
+const GOOGLE_SCOPES = [
+  'openid', 'email', 'profile',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
+].join(' ')
+
+function googleAuthUrl(state, mode = 'login') {
+  const u = new URL('https://accounts.google.com/o/oauth2/v2/auth')
+  u.searchParams.set('client_id', GOOGLE_CLIENT_ID)
+  u.searchParams.set('redirect_uri', GOOGLE_REDIRECT_URI)
+  u.searchParams.set('response_type', 'code')
+  u.searchParams.set('scope', GOOGLE_SCOPES)
+  u.searchParams.set('access_type', 'offline')
+  u.searchParams.set('prompt', 'consent')
+  u.searchParams.set('include_granted_scopes', 'true')
+  u.searchParams.set('state', state + '::' + mode)
+  return u.toString()
+}
+
+async function googleExchangeCode(code) {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code, client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: GOOGLE_REDIRECT_URI, grant_type: 'authorization_code',
+    }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error('Google token exchange failed: ' + (data.error_description || data.error || 'unknown'))
+  return data // { access_token, expires_in, refresh_token?, scope, token_type, id_token }
+}
+
+async function googleRefresh(refreshToken) {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+      grant_type: 'refresh_token', refresh_token: refreshToken,
+    }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error('Google refresh failed: ' + (data.error_description || data.error || 'unknown'))
+  return data
+}
+
+async function googleUserInfo(accessToken) {
+  const res = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } })
+  if (!res.ok) throw new Error('Failed to fetch Google user info')
+  return res.json()
+}
+
+async function getValidGoogleAccessToken(db, userId) {
+  const u = await db.collection('users').findOne({ id: userId })
+  if (!u || !u.googleAccessToken) throw new Error('Google account not connected. Re-authorize.')
+  const expiry = u.googleTokenExpiry ? new Date(u.googleTokenExpiry).getTime() : 0
+  if (Date.now() < expiry - 30000) return decryptStr(u.googleAccessToken)
+  // refresh
+  const rt = decryptStr(u.googleRefreshToken)
+  if (!rt) throw new Error('No Google refresh token. Reconnect Google account.')
+  const tk = await googleRefresh(rt)
+  const newExpiry = new Date(Date.now() + (tk.expires_in || 3600) * 1000).toISOString()
+  await db.collection('users').updateOne({ id: userId }, { $set: {
+    googleAccessToken: encryptStr(tk.access_token), googleTokenExpiry: newExpiry,
+  }})
+  return tk.access_token
+}
+
+async function googleListSheets(accessToken) {
+  const url = new URL('https://www.googleapis.com/drive/v3/files')
+  url.searchParams.set('q', "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false")
+  url.searchParams.set('fields', 'files(id,name,modifiedTime,owners)')
+  url.searchParams.set('pageSize', '100')
+  url.searchParams.set('orderBy', 'modifiedTime desc')
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } })
+  const data = await res.json()
+  if (!res.ok) throw new Error('Drive list failed: ' + (data.error?.message || 'unknown'))
+  return data.files || []
+}
+
+async function googleSpreadsheetMeta(accessToken, spreadsheetId) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=spreadsheetId,properties.title,sheets.properties(sheetId,title,gridProperties)`
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } })
+  const data = await res.json()
+  if (!res.ok) throw new Error('Sheets meta failed: ' + (data.error?.message || 'unknown'))
+  return data
+}
+
+async function googleFetchSheetData(accessToken, spreadsheetId, sheetTitle) {
+  const range = sheetTitle ? `'${sheetTitle.replace(/'/g, "''")}'` : 'Sheet1'
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?valueRenderOption=UNFORMATTED_VALUE`
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } })
+  const data = await res.json()
+  if (!res.ok) throw new Error('Sheets fetch failed: ' + (data.error?.message || 'unknown'))
+  const values = data.values || []
+  if (values.length === 0) return { columns: [], rows: [] }
+  const headerRow = values[0].map((h, i) => ({ id: `col${i}`, name: String(h ?? `Column ${i+1}`), type: 'string' }))
+  const rows = values.slice(1).map(r => {
+    const out = []
+    for (let i = 0; i < headerRow.length; i++) out.push(r[i] ?? null)
+    return out
+  })
+  return { columns: headerRow, rows }
+}
 
 async function handler(request, { params }) {
   const path = (params?.path || []).join('/')
@@ -351,6 +487,118 @@ async function handler(request, { params }) {
       return j({ ok: true })
     }
 
+    // ── Google OAuth ──
+    if (path === 'auth/google/start' && method === 'GET') {
+      if (!GOOGLE_CLIENT_ID) return e('Google OAuth not configured', 500)
+      const sp = new URL(request.url).searchParams
+      const linkToken = sp.get('link_token') // JWT of the user wanting to link their google account
+      const state = uuidv4()
+      const stateDoc = { id: state, createdAt: new Date().toISOString() }
+      if (linkToken) {
+        try { const decoded = jwt.verify(linkToken, JWT_SECRET); stateDoc.linkUserId = decoded.id } catch { /* fall through to normal login */ }
+      }
+      await db.collection('oauth_state').insertOne(stateDoc)
+      return NextResponse.redirect(googleAuthUrl(state, stateDoc.linkUserId ? 'link' : 'login'))
+    }
+
+    if (path === 'auth/google/callback' && method === 'GET') {
+      const sp = new URL(request.url).searchParams
+      const code = sp.get('code'); const rawState = sp.get('state') || ''
+      const errParam = sp.get('error')
+      const redirectFront = (qs) => NextResponse.redirect(`${BASE_URL}/?${qs}`)
+      if (errParam) return redirectFront(`google_error=${encodeURIComponent(errParam)}`)
+      if (!code || !rawState) return redirectFront('google_error=missing_code')
+      const [stateId, mode] = rawState.split('::')
+      const st = await db.collection('oauth_state').findOne({ id: stateId })
+      if (!st) return redirectFront('google_error=invalid_state')
+      await db.collection('oauth_state').deleteOne({ id: stateId })
+
+      let tk, info
+      try {
+        tk = await googleExchangeCode(code)
+        info = await googleUserInfo(tk.access_token)
+      } catch (err) {
+        return redirectFront(`google_error=${encodeURIComponent(err.message || 'oauth_failed')}`)
+      }
+      const email = (info.email || '').toLowerCase()
+      if (!email) return redirectFront('google_error=no_email')
+
+      const expiry = new Date(Date.now() + (tk.expires_in || 3600) * 1000).toISOString()
+      const tokenFields = {
+        googleAccessToken: encryptStr(tk.access_token),
+        googleTokenExpiry: expiry,
+        googleId: info.sub,
+        googleConnectedAt: new Date().toISOString(),
+      }
+      if (tk.refresh_token) tokenFields.googleRefreshToken = encryptStr(tk.refresh_token)
+
+      // Link to existing user if mode=link
+      let user
+      if (mode === 'link' && st.linkUserId) {
+        user = await db.collection('users').findOne({ id: st.linkUserId })
+        if (!user) return redirectFront('google_error=user_missing')
+        await db.collection('users').updateOne({ id: user.id }, { $set: tokenFields })
+        await logAct(db, user.id, 'google_connected', { email })
+        const jwtTok = signToken(user)
+        return redirectFront(`google_login=1&token=${jwtTok}&linked=1`)
+      }
+
+      // Otherwise login or signup
+      user = await db.collection('users').findOne({ email })
+      if (!user) {
+        user = {
+          id: uuidv4(), email, name: info.name || info.given_name || email.split('@')[0],
+          passwordHash: null, role: 'admin',
+          createdAt: new Date().toISOString(),
+          ...tokenFields,
+        }
+        await db.collection('users').insertOne(user)
+        await logAct(db, user.id, 'signup', { via: 'google' })
+      } else {
+        await db.collection('users').updateOne({ id: user.id }, { $set: tokenFields })
+        await logAct(db, user.id, 'login', { via: 'google' })
+      }
+      const jwtTok = signToken(user)
+      return redirectFront(`google_login=1&token=${jwtTok}`)
+    }
+
+    if (path === 'auth/reset' && method === 'POST') { /* handled above */ }
+
+    if (path === 'auth/google/status' && method === 'GET') {
+      const cu = getAuthUser(request); if (!cu) return e('Unauthorized', 401)
+      const u = await db.collection('users').findOne({ id: cu.id })
+      return j({ connected: !!u?.googleRefreshToken || !!u?.googleAccessToken, googleId: u?.googleId || null, connectedAt: u?.googleConnectedAt || null })
+    }
+    if (path === 'auth/google/disconnect' && method === 'POST') {
+      const cu = getAuthUser(request); if (!cu) return e('Unauthorized', 401)
+      await db.collection('users').updateOne({ id: cu.id }, { $unset: { googleAccessToken: '', googleRefreshToken: '', googleTokenExpiry: '', googleId: '', googleConnectedAt: '' } })
+      await logAct(db, cu.id, 'google_disconnected', {})
+      return j({ ok: true })
+    }
+
+    // List the user's Google Spreadsheets (Drive)
+    if (path === 'google/sheets' && method === 'GET') {
+      const cu = getAuthUser(request); if (!cu) return e('Unauthorized', 401)
+      try {
+        const at = await getValidGoogleAccessToken(db, cu.id)
+        const files = await googleListSheets(at)
+        return j({ sheets: files.map(f => ({ id: f.id, name: f.name, modifiedTime: f.modifiedTime })) })
+      } catch (err) { return e(err.message, 400) }
+    }
+    // List tabs of a specific spreadsheet
+    const gsTab = path.match(/^google\/sheets\/([^/]+)\/meta$/)
+    if (gsTab && method === 'GET') {
+      const cu = getAuthUser(request); if (!cu) return e('Unauthorized', 401)
+      try {
+        const at = await getValidGoogleAccessToken(db, cu.id)
+        const meta = await googleSpreadsheetMeta(at, gsTab[1])
+        return j({
+          spreadsheetId: meta.spreadsheetId, title: meta.properties?.title,
+          tabs: (meta.sheets || []).map(s => ({ sheetId: s.properties.sheetId, title: s.properties.title, rowCount: s.properties.gridProperties?.rowCount, columnCount: s.properties.gridProperties?.columnCount })),
+        })
+      } catch (err) { return e(err.message, 400) }
+    }
+
     // ── Legacy sheet parse (still used by some flows) ──
     if (path === 'sheets/parse' && method === 'POST') {
       const { url } = await request.json()
@@ -378,6 +626,14 @@ async function handler(request, { params }) {
         // verify
         const g = await fetchGvizJson(sheetId, gid); const p = parseGviz(g)
         src = { ...src, url: b.url, sheetId, gid, columnsMeta: p.columns, rowCount: p.rowCount }
+      } else if (b.type === 'google_sheet_private') {
+        if (!b.spreadsheetId || !b.sheetTitle) return e('Missing spreadsheetId or sheetTitle')
+        // verify via OAuth
+        try {
+          const at = await getValidGoogleAccessToken(db, u.id)
+          const sd = await googleFetchSheetData(at, b.spreadsheetId, b.sheetTitle)
+          src = { ...src, spreadsheetId: b.spreadsheetId, sheetTitle: b.sheetTitle, columnsMeta: sd.columns, rowCount: sd.rows.length }
+        } catch (err) { return e(err.message, 400) }
       } else if (b.type === 'xlsx_upload' || b.type === 'csv_upload') {
         if (!Array.isArray(b.columns) || !Array.isArray(b.rows)) return e('Missing columns/rows')
         src = { ...src, fileName: b.fileName || '', columnsMeta: b.columns, rowCount: b.rows.length,
@@ -398,6 +654,12 @@ async function handler(request, { params }) {
         let preview = []
         if (src.type === 'google_sheet') {
           try { const g = await fetchGvizJson(src.sheetId, src.gid); const p = parseGviz(g); preview = p.rows.slice(0,5).map(r => rowToObj(p.columns, r)) } catch {}
+        } else if (src.type === 'google_sheet_private') {
+          try {
+            const at = await getValidGoogleAccessToken(db, u.id)
+            const sd = await googleFetchSheetData(at, src.spreadsheetId, src.sheetTitle)
+            preview = sd.rows.slice(0, 5).map(r => rowToObj(sd.columns, r))
+          } catch {}
         } else {
           const cols = src.columnsMeta || []
           preview = (src.snapshot?.rows || []).slice(0, 5).map(r => rowToObj(cols, r))
