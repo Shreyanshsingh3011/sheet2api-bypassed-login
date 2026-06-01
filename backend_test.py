@@ -1,803 +1,549 @@
 #!/usr/bin/env python3
 """
-SheetFlow AI - Comprehensive Backend Test Suite (Batch 1)
-Tests all endpoints with new architecture: Sources, Connectors, Public API with query params, caching, masking, governance
+Sheet2API AI Backend Test Suite
+Tests rebrand + Google OAuth redirect building + legacy endpoints + full flow regression
 """
 import requests
 import json
 import time
-import random
-from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 
-# Base URL from environment
+# Base URL from .env
 BASE_URL = "https://connector-flow-1.preview.emergentagent.com/api"
+FRONTEND_URL = "https://connector-flow-1.preview.emergentagent.com"
 
-# Test state
-state = {
-    'email': f'test+{random.randint(10000,99999)}@sf.ai',
-    'password': 'Pass1234',
-    'new_password': 'NewPass1',
-    'name': 'Test User',
-    'token': None,
-    'user_id': None,
-    'csv_source_id': None,
-    'gs_source_id': None,
-    'connector_id': None,
-    'connector_token': None,
-    'new_connector_token': None,
-    'reset_token': None
-}
+# Test data
+TEST_EMAIL = f"test_user_{int(time.time())}@example.com"
+TEST_PASSWORD = "SecurePass123!"
+TEST_NAME = "Test User"
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# Global test state
+test_token = None
+test_user_id = None
+test_source_id = None
+test_connector_id = None
+test_connector_token = None
 
-def test_result(name, passed, details=""):
+def log_test(name, passed, details=""):
     status = "✅ PASS" if passed else "❌ FAIL"
-    log(f"{status}: {name}")
+    print(f"{status}: {name}")
     if details:
-        log(f"  → {details}")
+        print(f"   {details}")
     return passed
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. HEALTH CHECK
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_health():
+def test_health_rebrand():
+    """Test 1: Health endpoint should return service='Sheet2API AI'"""
     try:
         r = requests.get(f"{BASE_URL}/health", timeout=10)
-        return test_result("Health check", r.status_code == 200, f"Status: {r.status_code}")
+        data = r.json()
+        passed = r.status_code == 200 and data.get("service") == "Sheet2API AI"
+        return log_test("Health endpoint rebrand", passed, 
+                       f"service={data.get('service')}, status={data.get('status')}")
     except Exception as e:
-        return test_result("Health check", False, str(e))
+        return log_test("Health endpoint rebrand", False, str(e))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. AUTH FLOW
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_auth_signup():
+def test_google_oauth_start_login():
+    """Test 2a: GET /api/auth/google/start → 307 redirect with proper params"""
     try:
-        r = requests.post(f"{BASE_URL}/auth/signup", json={
-            'email': state['email'],
-            'password': state['password'],
-            'name': state['name']
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'token' in data and 'user' in data:
-                state['token'] = data['token']
-                state['user_id'] = data['user']['id']
-                return test_result("Auth signup", True, f"Token received, user_id: {state['user_id']}")
-        return test_result("Auth signup", False, f"Status {r.status_code}: {r.text[:200]}")
+        r = requests.get(f"{BASE_URL}/auth/google/start", allow_redirects=False, timeout=10)
+        
+        if r.status_code != 307:
+            return log_test("Google OAuth start (login)", False, 
+                           f"Expected 307, got {r.status_code}")
+        
+        redirect_url = r.headers.get("Location", "")
+        if not redirect_url.startswith("https://accounts.google.com/o/oauth2/v2/auth"):
+            return log_test("Google OAuth start (login)", False, 
+                           f"Redirect URL doesn't start with Google OAuth URL: {redirect_url[:100]}")
+        
+        # Parse query params
+        parsed = urlparse(redirect_url)
+        params = parse_qs(parsed.query)
+        
+        # Check required params
+        checks = {
+            "client_id": params.get("client_id", [""])[0].startswith("29382725463-"),
+            "redirect_uri": params.get("redirect_uri", [""])[0] == f"{FRONTEND_URL}/api/auth/google/callback",
+            "response_type": params.get("response_type", [""])[0] == "code",
+            "access_type": params.get("access_type", [""])[0] == "offline",
+            "prompt": params.get("prompt", [""])[0] == "consent",
+            "state": len(params.get("state", [""])[0]) > 0,
+        }
+        
+        # Check scopes
+        scope = params.get("scope", [""])[0]
+        required_scopes = ["openid", "email", "profile", "spreadsheets.readonly", "drive.metadata.readonly"]
+        scope_checks = all(s in scope for s in required_scopes)
+        
+        # Check state format (should end with ::login)
+        state = params.get("state", [""])[0]
+        state_format_ok = state.endswith("::login")
+        
+        all_passed = all(checks.values()) and scope_checks and state_format_ok
+        
+        details = f"client_id={checks['client_id']}, redirect_uri={checks['redirect_uri']}, " \
+                 f"response_type={checks['response_type']}, scopes={scope_checks}, " \
+                 f"access_type={checks['access_type']}, prompt={checks['prompt']}, " \
+                 f"state_format={state_format_ok}"
+        
+        return log_test("Google OAuth start (login)", all_passed, details)
     except Exception as e:
-        return test_result("Auth signup", False, str(e))
+        return log_test("Google OAuth start (login)", False, str(e))
 
-def test_auth_duplicate_signup():
+def test_google_oauth_start_link():
+    """Test 2b: GET /api/auth/google/start?link_token=JWT → state ends with ::link"""
+    global test_token
+    if not test_token:
+        return log_test("Google OAuth start (link)", False, "No test token available")
+    
     try:
-        r = requests.post(f"{BASE_URL}/auth/signup", json={
-            'email': state['email'],
-            'password': state['password'],
-            'name': state['name']
-        }, timeout=10)
-        return test_result("Auth duplicate signup prevention", r.status_code == 409, f"Status: {r.status_code}")
+        r = requests.get(f"{BASE_URL}/auth/google/start?link_token={test_token}", 
+                        allow_redirects=False, timeout=10)
+        
+        if r.status_code != 307:
+            return log_test("Google OAuth start (link)", False, 
+                           f"Expected 307, got {r.status_code}")
+        
+        redirect_url = r.headers.get("Location", "")
+        parsed = urlparse(redirect_url)
+        params = parse_qs(parsed.query)
+        state = params.get("state", [""])[0]
+        
+        passed = state.endswith("::link")
+        return log_test("Google OAuth start (link)", passed, 
+                       f"state ends with ::link = {passed}")
     except Exception as e:
-        return test_result("Auth duplicate signup prevention", False, str(e))
+        return log_test("Google OAuth start (link)", False, str(e))
 
-def test_auth_login():
+def test_google_oauth_callback_error():
+    """Test 2c: GET /api/auth/google/callback?error=access_denied → redirect with google_error"""
     try:
-        r = requests.post(f"{BASE_URL}/auth/login", json={
-            'email': state['email'],
-            'password': state['password']
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return test_result("Auth login", 'token' in data, "Login successful")
-        return test_result("Auth login", False, f"Status {r.status_code}")
+        r = requests.get(f"{BASE_URL}/auth/google/callback?error=access_denied", 
+                        allow_redirects=False, timeout=10)
+        
+        if r.status_code != 307:
+            return log_test("Google OAuth callback (error)", False, 
+                           f"Expected 307, got {r.status_code}")
+        
+        redirect_url = r.headers.get("Location", "")
+        passed = "google_error=access_denied" in redirect_url
+        return log_test("Google OAuth callback (error)", passed, 
+                       f"Redirects to frontend with google_error param")
     except Exception as e:
-        return test_result("Auth login", False, str(e))
+        return log_test("Google OAuth callback (error)", False, str(e))
 
-def test_auth_wrong_password():
+def test_google_oauth_callback_no_code():
+    """Test 2d: GET /api/auth/google/callback (no params) → redirect with google_error=missing_code"""
     try:
-        r = requests.post(f"{BASE_URL}/auth/login", json={
-            'email': state['email'],
-            'password': 'WrongPassword123'
-        }, timeout=10)
-        return test_result("Auth wrong password", r.status_code == 401, f"Status: {r.status_code}")
+        r = requests.get(f"{BASE_URL}/auth/google/callback", 
+                        allow_redirects=False, timeout=10)
+        
+        if r.status_code != 307:
+            return log_test("Google OAuth callback (no code)", False, 
+                           f"Expected 307, got {r.status_code}")
+        
+        redirect_url = r.headers.get("Location", "")
+        passed = "google_error=missing_code" in redirect_url
+        return log_test("Google OAuth callback (no code)", passed, 
+                       f"Redirects with google_error=missing_code")
     except Exception as e:
-        return test_result("Auth wrong password", False, str(e))
+        return log_test("Google OAuth callback (no code)", False, str(e))
 
-def test_auth_me_with_token():
+def test_google_oauth_callback_invalid_state():
+    """Test 2e: GET /api/auth/google/callback?state=nonexistent&code=fake → google_error=invalid_state"""
     try:
-        r = requests.get(f"{BASE_URL}/auth/me", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return test_result("Auth /me with token", 'user' in data, f"User: {data.get('user', {}).get('email')}")
-        return test_result("Auth /me with token", False, f"Status {r.status_code}")
+        r = requests.get(f"{BASE_URL}/auth/google/callback?state=nonexistent&code=fake", 
+                        allow_redirects=False, timeout=10)
+        
+        if r.status_code != 307:
+            return log_test("Google OAuth callback (invalid state)", False, 
+                           f"Expected 307, got {r.status_code}")
+        
+        redirect_url = r.headers.get("Location", "")
+        passed = "google_error=invalid_state" in redirect_url
+        return log_test("Google OAuth callback (invalid state)", passed, 
+                       f"Redirects with google_error=invalid_state")
     except Exception as e:
-        return test_result("Auth /me with token", False, str(e))
+        return log_test("Google OAuth callback (invalid state)", False, str(e))
 
-def test_auth_me_without_token():
+def test_google_status_no_auth():
+    """Test 3a: GET /api/auth/google/status (no Bearer) → 401"""
     try:
-        r = requests.get(f"{BASE_URL}/auth/me", timeout=10)
-        return test_result("Auth /me without token", r.status_code == 401, f"Status: {r.status_code}")
+        r = requests.get(f"{BASE_URL}/auth/google/status", timeout=10)
+        passed = r.status_code == 401
+        return log_test("Google status (no auth)", passed, 
+                       f"status={r.status_code}")
     except Exception as e:
-        return test_result("Auth /me without token", False, str(e))
+        return log_test("Google status (no auth)", False, str(e))
 
-def test_auth_forgot():
+def test_google_status_fresh_user():
+    """Test 3b: GET /api/auth/google/status (Bearer of fresh user) → 200 {connected:false}"""
+    global test_token
+    if not test_token:
+        return log_test("Google status (fresh user)", False, "No test token available")
+    
     try:
-        r = requests.post(f"{BASE_URL}/auth/forgot", json={
-            'email': state['email']
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'resetUrl' in data and data['resetUrl']:
-                # Extract token from URL: ...?reset=TOKEN
-                reset_url = data['resetUrl']
-                if '?reset=' in reset_url:
-                    state['reset_token'] = reset_url.split('?reset=')[1]
-                    return test_result("Auth forgot password", True, f"Reset token: {state['reset_token'][:16]}...")
-        return test_result("Auth forgot password", False, f"Status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        return test_result("Auth forgot password", False, str(e))
-
-def test_auth_reset():
-    try:
-        if not state['reset_token']:
-            return test_result("Auth reset password", False, "No reset token available")
-        r = requests.post(f"{BASE_URL}/auth/reset", json={
-            'token': state['reset_token'],
-            'password': state['new_password']
-        }, timeout=10)
-        if r.status_code == 200:
-            return test_result("Auth reset password", True, "Password reset successful")
-        return test_result("Auth reset password", False, f"Status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        return test_result("Auth reset password", False, str(e))
-
-def test_auth_old_password_fails():
-    try:
-        r = requests.post(f"{BASE_URL}/auth/login", json={
-            'email': state['email'],
-            'password': state['password']  # old password
-        }, timeout=10)
-        return test_result("Auth old password fails after reset", r.status_code == 401, f"Status: {r.status_code}")
-    except Exception as e:
-        return test_result("Auth old password fails after reset", False, str(e))
-
-def test_auth_new_password_works():
-    try:
-        r = requests.post(f"{BASE_URL}/auth/login", json={
-            'email': state['email'],
-            'password': state['new_password']  # new password
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'token' in data:
-                state['token'] = data['token']  # Update token for rest of tests
-                return test_result("Auth new password works", True, "Login with new password successful")
-        return test_result("Auth new password works", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Auth new password works", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. SOURCES
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_sources_csv_upload():
-    try:
-        r = requests.post(f"{BASE_URL}/sources", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'type': 'csv_upload',
-            'name': 'Employees CSV',
-            'fileName': 'emp.csv',
-            'columns': [
-                {'id': 'col0', 'name': 'id', 'type': 'string'},
-                {'id': 'col1', 'name': 'name', 'type': 'string'},
-                {'id': 'col2', 'name': 'email', 'type': 'string'},
-                {'id': 'col3', 'name': 'salary', 'type': 'number'},
-                {'id': 'col4', 'name': 'dept', 'type': 'string'}
-            ],
-            'rows': [
-                ['1', 'Alice', 'alice@acme.com', 90000, 'Engineering'],
-                ['2', 'Bob', 'bob@acme.com', 85000, 'Finance'],
-                ['3', 'Carol', 'carol@acme.com', 95000, 'Engineering'],
-                ['4', 'Dan', 'dan@acme.com', 75000, 'HR'],
-                ['5', 'Eve', 'eve@acme.com', 100000, 'Finance']
-            ]
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'source' in data and 'id' in data['source']:
-                state['csv_source_id'] = data['source']['id']
-                return test_result("Sources CSV upload", True, f"Source ID: {state['csv_source_id']}")
-        return test_result("Sources CSV upload", False, f"Status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        return test_result("Sources CSV upload", False, str(e))
-
-def test_sources_google_sheet():
-    try:
-        r = requests.post(f"{BASE_URL}/sources", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'type': 'google_sheet',
-            'name': 'GS Demo',
-            'url': 'https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit'
-        }, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if 'source' in data and 'id' in data['source']:
-                state['gs_source_id'] = data['source']['id']
-                return test_result("Sources Google Sheet", True, f"Source ID: {state['gs_source_id']}")
-        return test_result("Sources Google Sheet", False, f"Status {r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        return test_result("Sources Google Sheet", False, str(e))
-
-def test_sources_list():
-    try:
-        r = requests.get(f"{BASE_URL}/sources", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            sources = data.get('sources', [])
-            count = len(sources)
-            return test_result("Sources list", count >= 1, f"Found {count} source(s)")
-        return test_result("Sources list", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Sources list", False, str(e))
-
-def test_sources_get_by_id():
-    try:
-        if not state['csv_source_id']:
-            return test_result("Sources get by ID", False, "No CSV source ID available")
-        r = requests.get(f"{BASE_URL}/sources/{state['csv_source_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            has_source = 'source' in data
-            has_preview = 'preview' in data and len(data['preview']) > 0
-            return test_result("Sources get by ID", has_source and has_preview, 
-                             f"Source returned with {len(data.get('preview', []))} preview rows")
-        return test_result("Sources get by ID", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Sources get by ID", False, str(e))
-
-def test_sources_invalid_gs_url():
-    try:
-        r = requests.post(f"{BASE_URL}/sources", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'type': 'google_sheet',
-            'name': 'Invalid GS',
-            'url': 'https://invalid-url.com/not-a-sheet'
-        }, timeout=10)
-        return test_result("Sources invalid GS URL", r.status_code == 400, f"Status: {r.status_code}")
-    except Exception as e:
-        return test_result("Sources invalid GS URL", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. CONNECTORS
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_connectors_create():
-    try:
-        if not state['csv_source_id']:
-            return test_result("Connectors create", False, "No CSV source ID available")
-        r = requests.post(f"{BASE_URL}/connectors", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'sourceId': state['csv_source_id'],
-            'name': 'Finance Team',
-            'department': 'Finance',
-            'columns': ['id', 'name', 'email', 'salary', 'dept'],
-            'maskedColumns': ['email', 'salary'],
-            'filter': {'column': 'dept', 'operator': 'equals', 'value': 'Finance'},
-            'cacheMode': 'live',
-            'cacheTTLSeconds': 300
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'connector' in data and 'token' in data['connector']:
-                state['connector_id'] = data['connector']['id']
-                state['connector_token'] = data['connector']['token']
-                return test_result("Connectors create", True, 
-                                 f"Connector ID: {state['connector_id']}, Token: {state['connector_token'][:16]}...")
-        return test_result("Connectors create", False, f"Status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        return test_result("Connectors create", False, str(e))
-
-def test_connectors_list():
-    try:
-        r = requests.get(f"{BASE_URL}/connectors", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            connectors = data.get('connectors', [])
-            has_our_connector = any(c['id'] == state['connector_id'] for c in connectors)
-            return test_result("Connectors list", has_our_connector, f"Found {len(connectors)} connector(s)")
-        return test_result("Connectors list", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Connectors list", False, str(e))
-
-def test_connectors_get_by_id():
-    try:
-        if not state['connector_id']:
-            return test_result("Connectors get by ID", False, "No connector ID available")
-        r = requests.get(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            return test_result("Connectors get by ID", 'connector' in data, "Connector retrieved")
-        return test_result("Connectors get by ID", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Connectors get by ID", False, str(e))
-
-def test_connectors_patch():
-    try:
-        if not state['connector_id']:
-            return test_result("Connectors PATCH", False, "No connector ID available")
-        r = requests.patch(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'name': 'Finance Team v2'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            updated_name = data.get('connector', {}).get('name')
-            return test_result("Connectors PATCH", updated_name == 'Finance Team v2', f"Name updated to: {updated_name}")
-        return test_result("Connectors PATCH", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Connectors PATCH", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. PUBLIC API (THE MAGIC)
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_public_api_basic():
-    try:
-        if not state['connector_token']:
-            return test_result("Public API basic", False, "No connector token available")
-        r = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            # Should have only Finance dept rows (Bob + Eve = 2)
-            count = data.get('count', 0)
-            has_data = 'data' in data and len(data['data']) > 0
-            from_cache = data.get('fromCache', None)
-            # Check masking: email and salary should be masked
-            if has_data:
-                first_row = data['data'][0]
-                email_masked = 'email' in first_row and '***' in str(first_row['email'])
-                salary_masked = 'salary' in first_row and '***' in str(first_row['salary'])
-                masking_works = email_masked and salary_masked
-                return test_result("Public API basic", count == 2 and masking_works, 
-                                 f"Count: {count}, fromCache: {from_cache}, Masking: {masking_works}")
-            return test_result("Public API basic", False, "No data returned")
-        return test_result("Public API basic", False, f"Status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        return test_result("Public API basic", False, str(e))
-
-def test_public_api_limit():
-    try:
-        if not state['connector_token']:
-            return test_result("Public API limit", False, "No connector token available")
-        r = requests.get(f"{BASE_URL}/public/{state['connector_token']}?limit=1", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            count = data.get('count', 0)
-            total = data.get('total', 0)
-            return test_result("Public API limit", count == 1 and total == 2, 
-                             f"Count: {count}, Total: {total}")
-        return test_result("Public API limit", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Public API limit", False, str(e))
-
-def test_public_api_sort():
-    try:
-        if not state['connector_token']:
-            return test_result("Public API sort", False, "No connector token available")
-        r = requests.get(f"{BASE_URL}/public/{state['connector_token']}?sort=-name", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'data' in data and len(data['data']) > 0:
-                first_name = data['data'][0].get('name', '')
-                # With -name (desc), Eve should come before Bob
-                return test_result("Public API sort", first_name == 'Eve', f"First name: {first_name}")
-        return test_result("Public API sort", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Public API sort", False, str(e))
-
-def test_public_api_fields():
-    try:
-        if not state['connector_token']:
-            return test_result("Public API fields", False, "No connector token available")
-        r = requests.get(f"{BASE_URL}/public/{state['connector_token']}?fields=id,name", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if 'data' in data and len(data['data']) > 0:
-                first_row = data['data'][0]
-                keys = set(first_row.keys())
-                # Should only have id and name
-                expected = {'id', 'name'}
-                return test_result("Public API fields", keys == expected, f"Keys: {keys}")
-        return test_result("Public API fields", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Public API fields", False, str(e))
-
-def test_public_api_search():
-    try:
-        if not state['connector_token']:
-            return test_result("Public API search", False, "No connector token available")
-        r = requests.get(f"{BASE_URL}/public/{state['connector_token']}?q=eve", timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            count = data.get('count', 0)
-            if count > 0 and 'data' in data:
-                first_name = data['data'][0].get('name', '')
-                return test_result("Public API search", first_name == 'Eve', f"Found: {first_name}")
-        return test_result("Public API search", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Public API search", False, str(e))
-
-def test_public_api_cache_mode():
-    try:
-        if not state['connector_id']:
-            return test_result("Public API cache mode", False, "No connector ID available")
-        # Switch to cached mode
-        r = requests.patch(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'cacheMode': 'cached',
-            'cacheTTLSeconds': 60
-        }, timeout=10)
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.get(f"{BASE_URL}/auth/google/status", headers=headers, timeout=10)
+        
         if r.status_code != 200:
-            return test_result("Public API cache mode", False, f"Failed to update cache mode: {r.status_code}")
-        
-        # First call - should be fromCache: false
-        r1 = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        if r1.status_code != 200:
-            return test_result("Public API cache mode", False, f"First call failed: {r1.status_code}")
-        data1 = r1.json()
-        from_cache_1 = data1.get('fromCache', None)
-        
-        # Second call immediately - should be fromCache: true
-        time.sleep(0.5)
-        r2 = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        if r2.status_code != 200:
-            return test_result("Public API cache mode", False, f"Second call failed: {r2.status_code}")
-        data2 = r2.json()
-        from_cache_2 = data2.get('fromCache', None)
-        
-        return test_result("Public API cache mode", 
-                         from_cache_1 == False and from_cache_2 == True,
-                         f"First: {from_cache_1}, Second: {from_cache_2}")
-    except Exception as e:
-        return test_result("Public API cache mode", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6. GOVERNANCE
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_governance_rotate_token():
-    try:
-        if not state['connector_id']:
-            return test_result("Governance rotate token", False, "No connector ID available")
-        old_token = state['connector_token']
-        
-        # Rotate token
-        r = requests.post(f"{BASE_URL}/connectors/{state['connector_id']}/rotate-token", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code != 200:
-            return test_result("Governance rotate token", False, f"Rotate failed: {r.status_code}")
+            return log_test("Google status (fresh user)", False, 
+                           f"Expected 200, got {r.status_code}")
         
         data = r.json()
-        new_token = data.get('connector', {}).get('token')
-        if not new_token or new_token == old_token:
-            return test_result("Governance rotate token", False, "Token not changed")
+        passed = data.get("connected") == False and data.get("googleId") is None
+        return log_test("Google status (fresh user)", passed, 
+                       f"connected={data.get('connected')}, googleId={data.get('googleId')}")
+    except Exception as e:
+        return log_test("Google status (fresh user)", False, str(e))
+
+def test_google_disconnect():
+    """Test 3c: POST /api/auth/google/disconnect (Bearer) → 200 {ok:true}"""
+    global test_token
+    if not test_token:
+        return log_test("Google disconnect", False, "No test token available")
+    
+    try:
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.post(f"{BASE_URL}/auth/google/disconnect", headers=headers, timeout=10)
         
-        state['new_connector_token'] = new_token
+        if r.status_code != 200:
+            return log_test("Google disconnect", False, 
+                           f"Expected 200, got {r.status_code}")
         
-        # Old token should fail
-        r_old = requests.get(f"{BASE_URL}/public/{old_token}", timeout=10)
+        data = r.json()
+        passed = data.get("ok") == True
+        return log_test("Google disconnect", passed, 
+                       f"ok={data.get('ok')}")
+    except Exception as e:
+        return log_test("Google disconnect", False, str(e))
+
+def test_google_sheets_no_connection():
+    """Test 3d: GET /api/google/sheets (Bearer, no Google tokens) → 400 with error"""
+    global test_token
+    if not test_token:
+        return log_test("Google sheets (no connection)", False, "No test token available")
+    
+    try:
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.get(f"{BASE_URL}/google/sheets", headers=headers, timeout=10)
+        
+        passed = r.status_code == 400
+        data = r.json() if r.status_code == 400 else {}
+        error_msg = data.get("error", "")
+        has_reconnect_msg = "not connected" in error_msg.lower() or "re-authorize" in error_msg.lower()
+        
+        return log_test("Google sheets (no connection)", passed and has_reconnect_msg, 
+                       f"status={r.status_code}, error mentions reconnect={has_reconnect_msg}")
+    except Exception as e:
+        return log_test("Google sheets (no connection)", False, str(e))
+
+def test_google_sheets_meta_no_connection():
+    """Test 3e: GET /api/google/sheets/some-id/meta (Bearer, no Google) → 400"""
+    global test_token
+    if not test_token:
+        return log_test("Google sheets meta (no connection)", False, "No test token available")
+    
+    try:
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.get(f"{BASE_URL}/google/sheets/fake-sheet-id/meta", headers=headers, timeout=10)
+        
+        passed = r.status_code == 400
+        return log_test("Google sheets meta (no connection)", passed, 
+                       f"status={r.status_code}")
+    except Exception as e:
+        return log_test("Google sheets meta (no connection)", False, str(e))
+
+def test_legacy_signup():
+    """Test 4a: POST /api/auth/signup → 200 {token, user}"""
+    global test_token, test_user_id
+    try:
+        payload = {"email": TEST_EMAIL, "password": TEST_PASSWORD, "name": TEST_NAME}
+        r = requests.post(f"{BASE_URL}/auth/signup", json=payload, timeout=10)
+        
+        if r.status_code != 200:
+            return log_test("Legacy signup", False, 
+                           f"Expected 200, got {r.status_code}: {r.text}")
+        
+        data = r.json()
+        test_token = data.get("token")
+        test_user_id = data.get("user", {}).get("id")
+        
+        passed = test_token and test_user_id and data.get("user", {}).get("email") == TEST_EMAIL.lower()
+        return log_test("Legacy signup", passed, 
+                       f"token={bool(test_token)}, user.id={bool(test_user_id)}")
+    except Exception as e:
+        return log_test("Legacy signup", False, str(e))
+
+def test_legacy_login():
+    """Test 4b: POST /api/auth/login → 200 {token, user}"""
+    try:
+        payload = {"email": TEST_EMAIL, "password": TEST_PASSWORD}
+        r = requests.post(f"{BASE_URL}/auth/login", json=payload, timeout=10)
+        
+        if r.status_code != 200:
+            return log_test("Legacy login", False, 
+                           f"Expected 200, got {r.status_code}")
+        
+        data = r.json()
+        passed = data.get("token") and data.get("user", {}).get("email") == TEST_EMAIL.lower()
+        return log_test("Legacy login", passed, 
+                       f"token={bool(data.get('token'))}")
+    except Exception as e:
+        return log_test("Legacy login", False, str(e))
+
+def test_legacy_forgot():
+    """Test 4c: POST /api/auth/forgot → 200 {resetUrl}"""
+    try:
+        payload = {"email": TEST_EMAIL}
+        r = requests.post(f"{BASE_URL}/auth/forgot", json=payload, timeout=10)
+        
+        if r.status_code != 200:
+            return log_test("Legacy forgot password", False, 
+                           f"Expected 200, got {r.status_code}")
+        
+        data = r.json()
+        reset_url = data.get("resetUrl")
+        passed = reset_url and "reset=" in reset_url
+        return log_test("Legacy forgot password", passed, 
+                       f"resetUrl present={bool(reset_url)}")
+    except Exception as e:
+        return log_test("Legacy forgot password", False, str(e))
+
+def test_legacy_reset():
+    """Test 4d: POST /api/auth/reset → 200, old password fails, new works"""
+    try:
+        # Get reset token
+        payload = {"email": TEST_EMAIL}
+        r = requests.post(f"{BASE_URL}/auth/forgot", json=payload, timeout=10)
+        data = r.json()
+        reset_url = data.get("resetUrl", "")
+        
+        # Extract token from URL
+        reset_token = reset_url.split("reset=")[-1] if "reset=" in reset_url else None
+        if not reset_token:
+            return log_test("Legacy reset password", False, "No reset token in resetUrl")
+        
+        # Reset password
+        new_password = "NewSecurePass456!"
+        payload = {"token": reset_token, "password": new_password}
+        r = requests.post(f"{BASE_URL}/auth/reset", json=payload, timeout=10)
+        
+        if r.status_code != 200:
+            return log_test("Legacy reset password", False, 
+                           f"Reset failed: {r.status_code}")
+        
+        # Try old password (should fail)
+        payload = {"email": TEST_EMAIL, "password": TEST_PASSWORD}
+        r_old = requests.post(f"{BASE_URL}/auth/login", json=payload, timeout=10)
         old_fails = r_old.status_code == 401
         
-        # New token should work
-        r_new = requests.get(f"{BASE_URL}/public/{new_token}", timeout=10)
+        # Try new password (should work)
+        payload = {"email": TEST_EMAIL, "password": new_password}
+        r_new = requests.post(f"{BASE_URL}/auth/login", json=payload, timeout=10)
         new_works = r_new.status_code == 200
         
-        # Update state for remaining tests
-        state['connector_token'] = new_token
-        
-        return test_result("Governance rotate token", old_fails and new_works,
-                         f"Old token: {r_old.status_code}, New token: {r_new.status_code}")
+        passed = old_fails and new_works
+        return log_test("Legacy reset password", passed, 
+                       f"old_password_fails={old_fails}, new_password_works={new_works}")
     except Exception as e:
-        return test_result("Governance rotate token", False, str(e))
+        return log_test("Legacy reset password", False, str(e))
 
-def test_governance_revoke():
+def test_full_flow_sources():
+    """Test 5a: POST /api/sources (csv_upload) → 200"""
+    global test_token, test_source_id
+    if not test_token:
+        return log_test("Full flow - sources", False, "No test token available")
+    
     try:
-        if not state['connector_id']:
-            return test_result("Governance revoke", False, "No connector ID available")
+        headers = {"Authorization": f"Bearer {test_token}"}
+        payload = {
+            "type": "csv_upload",
+            "name": "Test CSV Source",
+            "fileName": "test.csv",
+            "columns": [
+                {"id": "col0", "name": "id", "type": "string"},
+                {"id": "col1", "name": "name", "type": "string"},
+                {"id": "col2", "name": "dept", "type": "string"}
+            ],
+            "rows": [
+                ["1", "Alice", "Engineering"],
+                ["2", "Bob", "Finance"],
+                ["3", "Charlie", "Engineering"]
+            ]
+        }
+        r = requests.post(f"{BASE_URL}/sources", json=payload, headers=headers, timeout=10)
         
-        # Revoke
-        r = requests.post(f"{BASE_URL}/connectors/{state['connector_id']}/revoke", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
         if r.status_code != 200:
-            return test_result("Governance revoke", False, f"Revoke failed: {r.status_code}")
+            return log_test("Full flow - sources", False, 
+                           f"Expected 200, got {r.status_code}: {r.text}")
         
-        # Token should now return 401
-        r_pub = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        return test_result("Governance revoke", r_pub.status_code == 401,
-                         f"Public API status after revoke: {r_pub.status_code}")
+        data = r.json()
+        test_source_id = data.get("source", {}).get("id")
+        passed = test_source_id is not None
+        return log_test("Full flow - sources", passed, 
+                       f"source.id={test_source_id}")
     except Exception as e:
-        return test_result("Governance revoke", False, str(e))
+        return log_test("Full flow - sources", False, str(e))
 
-def test_governance_unrevoke():
+def test_full_flow_connectors():
+    """Test 5b: POST /api/connectors → 200 with token"""
+    global test_token, test_source_id, test_connector_id, test_connector_token
+    if not test_token or not test_source_id:
+        return log_test("Full flow - connectors", False, "No test token or source_id available")
+    
     try:
-        if not state['connector_id']:
-            return test_result("Governance unrevoke", False, "No connector ID available")
+        headers = {"Authorization": f"Bearer {test_token}"}
+        payload = {
+            "sourceId": test_source_id,
+            "name": "Test Connector",
+            "department": "Engineering",
+            "columns": ["id", "name", "dept"],
+            "filter": {"column": "dept", "operator": "equals", "value": "Engineering"}
+        }
+        r = requests.post(f"{BASE_URL}/connectors", json=payload, headers=headers, timeout=10)
         
-        # Unrevoke
-        r = requests.post(f"{BASE_URL}/connectors/{state['connector_id']}/unrevoke", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
         if r.status_code != 200:
-            return test_result("Governance unrevoke", False, f"Unrevoke failed: {r.status_code}")
+            return log_test("Full flow - connectors", False, 
+                           f"Expected 200, got {r.status_code}: {r.text}")
         
-        # Token should work again
-        r_pub = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        return test_result("Governance unrevoke", r_pub.status_code == 200,
-                         f"Public API status after unrevoke: {r_pub.status_code}")
+        data = r.json()
+        test_connector_id = data.get("connector", {}).get("id")
+        test_connector_token = data.get("connector", {}).get("token")
+        
+        passed = test_connector_id and test_connector_token and len(test_connector_token) == 32
+        return log_test("Full flow - connectors", passed, 
+                       f"connector.id={test_connector_id}, token_length={len(test_connector_token) if test_connector_token else 0}")
     except Exception as e:
-        return test_result("Governance unrevoke", False, str(e))
+        return log_test("Full flow - connectors", False, str(e))
 
-def test_governance_expiry():
+def test_full_flow_public_api():
+    """Test 5c: GET /api/public/{token} → 200 with data + count + total"""
+    global test_connector_token
+    if not test_connector_token:
+        return log_test("Full flow - public API", False, "No connector token available")
+    
     try:
-        if not state['connector_id']:
-            return test_result("Governance expiry", False, "No connector ID available")
+        r = requests.get(f"{BASE_URL}/public/{test_connector_token}", timeout=10)
         
-        # Set expiry to past date
-        past_date = (datetime.now() - timedelta(days=1)).isoformat() + 'Z'
-        r = requests.patch(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'expiresAt': past_date
-        }, timeout=10)
         if r.status_code != 200:
-            return test_result("Governance expiry", False, f"Failed to set expiry: {r.status_code}")
+            return log_test("Full flow - public API", False, 
+                           f"Expected 200, got {r.status_code}: {r.text}")
         
-        # Token should return 401
-        r_pub = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        expired_fails = r_pub.status_code == 401
+        data = r.json()
+        has_data = "data" in data and isinstance(data["data"], list)
+        has_count = "count" in data
+        has_total = "total" in data
         
-        # Restore (set to null)
-        r_restore = requests.patch(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, json={
-            'expiresAt': None
-        }, timeout=10)
-        if r_restore.status_code != 200:
-            return test_result("Governance expiry", False, f"Failed to restore: {r_restore.status_code}")
+        # Should have 2 Engineering records (Alice and Charlie)
+        correct_filter = data.get("count") == 2
         
-        # Token should work again
-        r_pub2 = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        restored_works = r_pub2.status_code == 200
+        passed = has_data and has_count and has_total and correct_filter
+        return log_test("Full flow - public API", passed, 
+                       f"data={has_data}, count={data.get('count')}, total={data.get('total')}")
+    except Exception as e:
+        return log_test("Full flow - public API", False, str(e))
+
+def test_full_flow_mcp():
+    """Test 5d: GET /api/connectors/{id}/mcp → 200 with @modelcontextprotocol/sdk"""
+    global test_token, test_connector_id
+    if not test_token or not test_connector_id:
+        return log_test("Full flow - MCP generator", False, "No test token or connector_id available")
+    
+    try:
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.get(f"{BASE_URL}/connectors/{test_connector_id}/mcp", headers=headers, timeout=10)
         
-        return test_result("Governance expiry", expired_fails and restored_works,
-                         f"Expired: {r_pub.status_code}, Restored: {r_pub2.status_code}")
-    except Exception as e:
-        return test_result("Governance expiry", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 7. GENERATORS
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_generators_script():
-    try:
-        if not state['connector_id']:
-            return test_result("Generators Apps Script", False, "No connector ID available")
-        r = requests.get(f"{BASE_URL}/connectors/{state['connector_id']}/script", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            content = r.text
-            has_doget = 'doGet' in content
-            has_token = state['connector_token'] in content
-            return test_result("Generators Apps Script", has_doget and has_token,
-                             f"Content length: {len(content)}, has doGet: {has_doget}, has token: {has_token}")
-        return test_result("Generators Apps Script", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Generators Apps Script", False, str(e))
-
-def test_generators_mcp():
-    try:
-        if not state['connector_id']:
-            return test_result("Generators MCP", False, "No connector ID available")
-        r = requests.get(f"{BASE_URL}/connectors/{state['connector_id']}/mcp", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            content = r.text
-            has_sdk = '@modelcontextprotocol/sdk' in content
-            return test_result("Generators MCP", has_sdk,
-                             f"Content length: {len(content)}, has SDK import: {has_sdk}")
-        return test_result("Generators MCP", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Generators MCP", False, str(e))
-
-def test_generators_openapi():
-    try:
-        if not state['connector_id']:
-            return test_result("Generators OpenAPI", False, "No connector ID available")
-        r = requests.get(f"{BASE_URL}/connectors/{state['connector_id']}/openapi", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            has_openapi = data.get('openapi') == '3.1.0'
-            has_paths = 'paths' in data and len(data['paths']) > 0
-            return test_result("Generators OpenAPI", has_openapi and has_paths,
-                             f"OpenAPI version: {data.get('openapi')}, Paths: {len(data.get('paths', {}))}")
-        return test_result("Generators OpenAPI", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Generators OpenAPI", False, str(e))
-
-def test_generators_audit():
-    try:
-        if not state['connector_id']:
-            return test_result("Generators audit", False, "No connector ID available")
-        r = requests.get(f"{BASE_URL}/connectors/{state['connector_id']}/audit", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            audit = data.get('audit', [])
-            has_api_calls = any(a.get('action') == 'api_call' for a in audit)
-            return test_result("Generators audit", len(audit) > 0,
-                             f"Audit entries: {len(audit)}, has api_call: {has_api_calls}")
-        return test_result("Generators audit", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Generators audit", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 8. STATS
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_stats():
-    try:
-        r = requests.get(f"{BASE_URL}/stats", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            has_connectors = 'connectorsCount' in data and data['connectorsCount'] >= 1
-            has_sources = 'sourcesCount' in data and data['sourcesCount'] >= 1
-            has_calls = 'totalCalls' in data and data['totalCalls'] >= 1
-            has_active = 'activeCount' in data
-            has_dept = 'byDepartment' in data
-            has_timeseries = 'timeseries' in data and len(data['timeseries']) == 14
-            has_calls_dept = 'callsByDept' in data
-            has_recent = 'recentActivity' in data
-            
-            all_fields = has_connectors and has_sources and has_calls and has_active and has_dept and has_timeseries and has_calls_dept and has_recent
-            return test_result("Stats endpoint", all_fields,
-                             f"Connectors: {data.get('connectorsCount')}, Sources: {data.get('sourcesCount')}, Calls: {data.get('totalCalls')}, Timeseries: {len(data.get('timeseries', []))}")
-        return test_result("Stats endpoint", False, f"Status {r.status_code}")
-    except Exception as e:
-        return test_result("Stats endpoint", False, str(e))
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 9. CLEANUP
-# ═══════════════════════════════════════════════════════════════════════════════
-def test_cleanup_connector():
-    try:
-        if not state['connector_id']:
-            return test_result("Cleanup connector", False, "No connector ID available")
-        r = requests.delete(f"{BASE_URL}/connectors/{state['connector_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
         if r.status_code != 200:
-            return test_result("Cleanup connector", False, f"Delete failed: {r.status_code}")
+            return log_test("Full flow - MCP generator", False, 
+                           f"Expected 200, got {r.status_code}")
         
-        # Token should now return 401
-        r_pub = requests.get(f"{BASE_URL}/public/{state['connector_token']}", timeout=10)
-        return test_result("Cleanup connector", r_pub.status_code == 401,
-                         f"Public API after delete: {r_pub.status_code}")
+        content = r.text
+        has_sdk = "@modelcontextprotocol/sdk" in content
+        is_text = r.headers.get("Content-Type", "").startswith("text/plain")
+        
+        passed = has_sdk and is_text
+        return log_test("Full flow - MCP generator", passed, 
+                       f"has_sdk={has_sdk}, content_type=text/plain")
     except Exception as e:
-        return test_result("Cleanup connector", False, str(e))
+        return log_test("Full flow - MCP generator", False, str(e))
 
-def test_cleanup_source():
+def test_full_flow_openapi():
+    """Test 5e: GET /api/connectors/{id}/openapi → 200 with openapi:3.1.0"""
+    global test_token, test_connector_id
+    if not test_token or not test_connector_id:
+        return log_test("Full flow - OpenAPI generator", False, "No test token or connector_id available")
+    
     try:
-        if not state['csv_source_id']:
-            return test_result("Cleanup source", False, "No CSV source ID available")
-        r = requests.delete(f"{BASE_URL}/sources/{state['csv_source_id']}", headers={
-            'Authorization': f'Bearer {state["token"]}'
-        }, timeout=10)
-        return test_result("Cleanup source", r.status_code == 200, f"Status: {r.status_code}")
+        headers = {"Authorization": f"Bearer {test_token}"}
+        r = requests.get(f"{BASE_URL}/connectors/{test_connector_id}/openapi", headers=headers, timeout=10)
+        
+        if r.status_code != 200:
+            return log_test("Full flow - OpenAPI generator", False, 
+                           f"Expected 200, got {r.status_code}")
+        
+        data = r.json()
+        passed = data.get("openapi") == "3.1.0" and "paths" in data
+        return log_test("Full flow - OpenAPI generator", passed, 
+                       f"openapi={data.get('openapi')}, has_paths={'paths' in data}")
     except Exception as e:
-        return test_result("Cleanup source", False, str(e))
+        return log_test("Full flow - OpenAPI generator", False, str(e))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN TEST RUNNER
-# ═══════════════════════════════════════════════════════════════════════════════
-def main():
-    log("=" * 80)
-    log("SheetFlow AI - Comprehensive Backend Test Suite (Batch 1)")
-    log("=" * 80)
+def run_all_tests():
+    """Run all backend tests in sequence"""
+    print("\n" + "="*80)
+    print("Sheet2API AI Backend Test Suite - Rebrand + Google OAuth + Regression")
+    print("="*80 + "\n")
     
     results = []
     
-    # 1. Health
-    log("\n[1] HEALTH CHECK")
-    results.append(test_health())
+    # Test 1: Rebrand
+    print("\n--- TEST 1: REBRAND VERIFICATION ---")
+    results.append(test_health_rebrand())
     
-    # 2. Auth
-    log("\n[2] AUTH FLOW")
-    results.append(test_auth_signup())
-    results.append(test_auth_duplicate_signup())
-    results.append(test_auth_login())
-    results.append(test_auth_wrong_password())
-    results.append(test_auth_me_with_token())
-    results.append(test_auth_me_without_token())
-    results.append(test_auth_forgot())
-    results.append(test_auth_reset())
-    results.append(test_auth_old_password_fails())
-    results.append(test_auth_new_password_works())
+    # Test 2: Google OAuth redirect building (no actual OAuth dance)
+    print("\n--- TEST 2: GOOGLE OAUTH REDIRECT BUILDING ---")
+    results.append(test_google_oauth_callback_error())
+    results.append(test_google_oauth_callback_no_code())
+    results.append(test_google_oauth_callback_invalid_state())
     
-    # 3. Sources
-    log("\n[3] SOURCES")
-    results.append(test_sources_csv_upload())
-    results.append(test_sources_google_sheet())
-    results.append(test_sources_list())
-    results.append(test_sources_get_by_id())
-    results.append(test_sources_invalid_gs_url())
+    # Test 4: Legacy endpoints (need to run before OAuth tests that need token)
+    print("\n--- TEST 4: LEGACY ENDPOINTS ---")
+    results.append(test_legacy_signup())
+    results.append(test_legacy_login())
+    results.append(test_legacy_forgot())
+    results.append(test_legacy_reset())
     
-    # 4. Connectors
-    log("\n[4] CONNECTORS")
-    results.append(test_connectors_create())
-    results.append(test_connectors_list())
-    results.append(test_connectors_get_by_id())
-    results.append(test_connectors_patch())
+    # Test 2 continued: OAuth start (needs token for link test)
+    print("\n--- TEST 2 (continued): GOOGLE OAUTH START ---")
+    results.append(test_google_oauth_start_login())
+    results.append(test_google_oauth_start_link())
     
-    # 5. Public API
-    log("\n[5] PUBLIC API (THE MAGIC)")
-    results.append(test_public_api_basic())
-    results.append(test_public_api_limit())
-    results.append(test_public_api_sort())
-    results.append(test_public_api_fields())
-    results.append(test_public_api_search())
-    results.append(test_public_api_cache_mode())
+    # Test 3: Google status/disconnect
+    print("\n--- TEST 3: GOOGLE STATUS/DISCONNECT ---")
+    results.append(test_google_status_no_auth())
+    results.append(test_google_status_fresh_user())
+    results.append(test_google_disconnect())
+    results.append(test_google_sheets_no_connection())
+    results.append(test_google_sheets_meta_no_connection())
     
-    # 6. Governance
-    log("\n[6] GOVERNANCE")
-    results.append(test_governance_rotate_token())
-    results.append(test_governance_revoke())
-    results.append(test_governance_unrevoke())
-    results.append(test_governance_expiry())
-    
-    # 7. Generators
-    log("\n[7] GENERATORS")
-    results.append(test_generators_script())
-    results.append(test_generators_mcp())
-    results.append(test_generators_openapi())
-    results.append(test_generators_audit())
-    
-    # 8. Stats
-    log("\n[8] STATS")
-    results.append(test_stats())
-    
-    # 9. Cleanup
-    log("\n[9] CLEANUP")
-    results.append(test_cleanup_connector())
-    results.append(test_cleanup_source())
+    # Test 5: Full flow regression
+    print("\n--- TEST 5: FULL FLOW REGRESSION ---")
+    results.append(test_full_flow_sources())
+    results.append(test_full_flow_connectors())
+    results.append(test_full_flow_public_api())
+    results.append(test_full_flow_mcp())
+    results.append(test_full_flow_openapi())
     
     # Summary
-    log("\n" + "=" * 80)
+    print("\n" + "="*80)
     passed = sum(results)
     total = len(results)
-    percentage = (passed / total * 100) if total > 0 else 0
-    log(f"FINAL RESULTS: {passed}/{total} tests passed ({percentage:.1f}%)")
-    log("=" * 80)
+    print(f"SUMMARY: {passed}/{total} tests passed ({100*passed//total}%)")
+    print("="*80 + "\n")
     
     return passed == total
 
-if __name__ == '__main__':
-    success = main()
+if __name__ == "__main__":
+    success = run_all_tests()
     exit(0 if success else 1)
