@@ -262,84 +262,34 @@ function Landing({ onStart }) {
   )
 }
 
-// ──────────────────── Auth ────────────────────
+// ──────────────────── Auth (Google-only) ────────────────────
 function AuthDialog({ open, onOpenChange, mode, setMode, onAuthed }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [name, setName] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [showPw, setShowPw] = useState(false)
-  const [forgotEmail, setForgotEmail] = useState('')
-  const [resetUrl, setResetUrl] = useState('')
-
-  const submit = async (ev) => {
-    ev.preventDefault(); setLoading(true)
-    try {
-      const path = mode === 'login' ? 'auth/login' : 'auth/signup'
-      const body = mode === 'login' ? { email, password } : { email, password, name }
-      const data = await api(path, { method: 'POST', body: JSON.stringify(body) })
-      localStorage.setItem('sf_token', data.token); onAuthed(data.user)
-    } catch (err) { toast.error(err.message) } finally { setLoading(false) }
-  }
-
-  const forgot = async () => {
-    setLoading(true); setResetUrl('')
-    try { const d = await api('auth/forgot', { method: 'POST', body: JSON.stringify({ email: forgotEmail }) }); setResetUrl(d.resetUrl || ''); toast.success('Reset link generated') }
-    catch (err) { toast.error(err.message) } finally { setLoading(false) }
-  }
-
+  const goGoogle = () => { window.location.href = '/api/auth/google/start' }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{mode === 'login' ? 'Welcome back' : mode === 'signup' ? 'Create your account' : 'Reset your password'}</DialogTitle>
-          <DialogDescription>
-            {mode === 'login' ? 'Sign in to manage your connectors.' : mode === 'signup' ? 'Build secure spreadsheet APIs in 30 seconds.' : "Enter your email — we'll generate a reset link."}
+          <div className="mx-auto mb-3 w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center"><Sheet className="w-7 h-7 text-white" /></div>
+          <DialogTitle className="text-center text-xl">{mode === 'login' ? 'Welcome back' : 'Get started in seconds'}</DialogTitle>
+          <DialogDescription className="text-center">
+            {mode === 'login' ? 'Sign in to your Sheet2API AI workspace.' : 'Create your account with Google — no password to remember.'}
           </DialogDescription>
         </DialogHeader>
-
-        {mode !== 'forgot' && (
-          <>
-            <Button type="button" variant="outline" className="w-full" onClick={() => { window.location.href = '/api/auth/google/start' }}>
-              <svg className="w-4 h-4 mr-2" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.3-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 13 24 13c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.7 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.2 5.2C40.9 36 44 30.5 44 24c0-1.2-.1-2.3-.4-3.5z"/></svg>
-              Continue with Google
-            </Button>
-            <div className="flex items-center gap-3 my-1"><div className="flex-1 h-px bg-border" /><span className="text-xs text-muted-foreground">or with email</span><div className="flex-1 h-px bg-border" /></div>
-            <form onSubmit={submit} className="space-y-3">
-              {mode === 'signup' && (<div><Label>Name</Label><Input value={name} onChange={e => setName(e.target.value)} placeholder="Jane Doe" /></div>)}
-              <div><Label>Email</Label><Input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="you@company.com" /></div>
-              <div>
-                <Label>Password</Label>
-                <div className="relative">
-                  <Input type={showPw ? 'text' : 'password'} required value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
-                  <button type="button" onClick={() => setShowPw(s => !s)} className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground">{showPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}</button>
-                </div>
-              </div>
-              <Button type="submit" disabled={loading} className="w-full bg-gradient-to-r from-indigo-500 to-cyan-500">{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : (mode === 'login' ? 'Login' : 'Sign up')}</Button>
-              <div className="text-sm text-center text-muted-foreground flex items-center justify-between">
-                <button type="button" onClick={() => setMode('forgot')} className="text-cyan-400 hover:underline">Forgot password?</button>
-                <button type="button" onClick={() => setMode(mode === 'login' ? 'signup' : 'login')} className="text-cyan-400 hover:underline">{mode === 'login' ? 'Create account' : 'Have an account?'}</button>
-              </div>
-            </form>
-          </>
-        )}
-
-        {mode === 'forgot' && (
-          <div className="space-y-3">
-            <div><Label>Email</Label><Input type="email" value={forgotEmail} onChange={e => setForgotEmail(e.target.value)} placeholder="you@company.com" /></div>
-            <Button disabled={loading} onClick={forgot} className="w-full bg-gradient-to-r from-indigo-500 to-cyan-500">{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Generate reset link'}</Button>
-            {resetUrl && (
-              <div className="border border-amber-500/30 bg-amber-500/5 rounded-md p-3 text-xs">
-                <div className="flex items-center gap-2 text-amber-300 mb-2"><AlertTriangle className="w-4 h-4" /> Email delivery isn't wired yet — copy this link:</div>
-                <div className="flex gap-2 bg-background/60 rounded p-2 font-mono break-all">
-                  <span className="flex-1">{resetUrl}</span>
-                  <button onClick={() => { navigator.clipboard.writeText(resetUrl); toast.success('Copied') }}><Copy className="w-3 h-3" /></button>
-                </div>
-              </div>
-            )}
-            <div className="text-sm text-center"><button onClick={() => setMode('login')} className="text-cyan-400 hover:underline">← Back to login</button></div>
+        <div className="space-y-4 py-2">
+          <Button onClick={goGoogle} size="lg" className="w-full bg-white text-slate-900 hover:bg-slate-100 border border-slate-300 font-medium">
+            <svg className="w-5 h-5 mr-3" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.3-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 16 19 13 24 13c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.7 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.2 5.2C40.9 36 44 30.5 44 24c0-1.2-.1-2.3-.4-3.5z"/></svg>
+            Continue with Google
+          </Button>
+          <div className="text-xs text-center text-muted-foreground space-y-1">
+            <p>We'll create your account on first sign-in — instantly.</p>
+            <p>Your spreadsheets stay private and encrypted with AES-256.</p>
           </div>
-        )}
+          <Separator />
+          <div className="text-xs text-center text-muted-foreground">
+            By continuing, you agree to our terms. <br />
+            <span className="text-muted-foreground/70">© {new Date().getFullYear()} Sthapana Technologies Pvt Ltd</span>
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
   )
