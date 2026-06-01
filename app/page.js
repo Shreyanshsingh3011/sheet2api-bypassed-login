@@ -140,7 +140,7 @@ function PublicNav({ onLogin, onSignup }) {
       <div className="container mx-auto flex items-center justify-between h-16 px-4">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center"><Sheet className="w-4 h-4 text-white" /></div>
-          <span className="font-semibold text-lg tracking-tight">SheetFlow <span className="text-cyan-400">AI</span></span>
+          <span className="font-semibold text-lg tracking-tight">Sheet2API <span className="text-cyan-400">AI</span></span>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="sm" onClick={onLogin}>Login</Button>
@@ -244,6 +244,20 @@ function Landing({ onStart }) {
         <p className="mt-3 text-muted-foreground">Free to try. No credit card.</p>
         <Button size="lg" className="mt-6 bg-gradient-to-r from-indigo-500 to-cyan-500" onClick={onStart}>Get Started <ArrowRight className="w-4 h-4 ml-2" /></Button>
       </section>
+
+      {/* Footer */}
+      <footer className="border-t border-border/40 mt-10">
+        <div className="container mx-auto px-4 py-8 flex flex-col md:flex-row items-center justify-between gap-4 text-sm">
+          <div className="flex items-center gap-2 text-muted-foreground">
+            <div className="w-7 h-7 rounded-md bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center"><Sheet className="w-3.5 h-3.5 text-white" /></div>
+            <span>Sheet2API <span className="text-cyan-400 font-semibold">AI</span></span>
+          </div>
+          <div className="text-muted-foreground text-center md:text-right">
+            <div>Developed by <span className="text-foreground font-medium">Sthapana Technologies Pvt Ltd</span></div>
+            <div className="text-xs mt-0.5">© {new Date().getFullYear()} Sthapana Technologies Pvt Ltd. All rights reserved.</div>
+          </div>
+        </div>
+      </footer>
     </main>
   )
 }
@@ -370,7 +384,7 @@ function Sidebar({ appPage, setAppPage, user, onLogout }) {
       <div className="p-4 border-b border-border/60">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 flex items-center justify-center"><Sheet className="w-4 h-4 text-white" /></div>
-          <div><div className="font-semibold leading-tight">SheetFlow <span className="text-cyan-400">AI</span></div></div>
+          <div><div className="font-semibold leading-tight">Sheet2API <span className="text-cyan-400">AI</span></div></div>
         </div>
       </div>
       <nav className="p-3 flex-1 space-y-1">
@@ -391,6 +405,9 @@ function Sidebar({ appPage, setAppPage, user, onLogout }) {
             <div className="text-xs text-muted-foreground truncate">{user.email}</div>
           </div>
           <button onClick={onLogout} className="text-muted-foreground hover:text-foreground"><LogOut className="w-4 h-4" /></button>
+        </div>
+        <div className="text-[10px] text-muted-foreground/70 px-2 pt-2 leading-tight">
+          © {new Date().getFullYear()} <span className="text-muted-foreground">Sthapana Technologies Pvt Ltd</span>
         </div>
       </div>
     </aside>
@@ -1087,7 +1104,7 @@ function ViewDetail({ view: initial, onBack, onUpdate, onDeleted }) {
           <Card className="border-border/60">
             <CardHeader className="flex-row flex items-center justify-between space-y-0">
               <div><CardTitle className="text-base">MCP Server</CardTitle><CardDescription>Drop into Claude Desktop, Cursor, or any MCP-compatible AI agent.</CardDescription></div>
-              <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => copy(mcp, 'MCP code')} disabled={!mcp}><Copy className="w-4 h-4 mr-2" />Copy</Button><Button size="sm" variant="outline" onClick={() => dl(mcp, `sheetflow-${c.name.replace(/\s+/g, '_')}.mjs`)} disabled={!mcp}><Download className="w-4 h-4 mr-2" />Download .mjs</Button></div>
+              <div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => copy(mcp, 'MCP code')} disabled={!mcp}><Copy className="w-4 h-4 mr-2" />Copy</Button><Button size="sm" variant="outline" onClick={() => dl(mcp, `sheet2api-${c.name.replace(/\s+/g, '_')}.mjs`)} disabled={!mcp}><Download className="w-4 h-4 mr-2" />Download .mjs</Button></div>
             </CardHeader>
             <CardContent>
               <div className="text-xs text-muted-foreground border-l-2 border-cyan-500/40 pl-3 mb-3">
