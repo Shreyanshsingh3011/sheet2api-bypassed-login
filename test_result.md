@@ -183,6 +183,111 @@ backend:
         agent: "testing"
         comment: "✅ ALL ENDPOINTS WORKING: GET /api/connectors/:id/script returns text/plain Apps Script code containing doGet function, connector token, SHEET_ID, and deployment instructions. POST /api/connectors/:id/sync returns 200 with lastSyncAt timestamp. GET /api/stats returns connectorsCount, totalCalls, activeCount, byDepartment object, and recentActivity array. GET /api/activity returns activity array with all events (signup, login, connector_created, api_call, connector_synced, connector_deleted). All require auth."
 
+  - task: "Password reset flow (forgot/reset)"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/auth/forgot {email} returns {resetUrl} with token. POST /api/auth/reset {token, password} resets password. Old password no longer works after reset."
+      - working: true
+        agent: "testing"
+        comment: "✅ PASSWORD RESET WORKING: POST /auth/forgot returns 200 with resetUrl containing reset token. POST /auth/reset with valid token successfully resets password. Old password correctly returns 401 after reset. New password login works and returns valid JWT token. Token extraction from resetUrl works properly."
+
+  - task: "Sources CRUD (google_sheet, csv_upload, xlsx_upload)"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/sources {type, name, url/columns/rows} creates source. GET /api/sources lists user sources. GET /api/sources/:id returns source + preview. DELETE /api/sources/:id removes source. Supports google_sheet, csv_upload, xlsx_upload types."
+      - working: true
+        agent: "testing"
+        comment: "✅ SOURCES CRUD WORKING: POST /sources with csv_upload (columns+rows) returns 200 with source.id. POST /sources with google_sheet URL successfully parses public sheet. GET /sources returns list of user sources (found 2). GET /sources/:id returns source with 5 preview rows. DELETE /sources/:id returns 200. Invalid Google Sheets URL correctly returns 400. All endpoints require auth and are scoped by userId."
+
+  - task: "Connectors with sourceId + masking + caching + filter"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/connectors {sourceId, name, department, columns, filter, maskedColumns, cacheMode, cacheTTLSeconds} creates connector. PATCH /api/connectors/:id updates fields and clears cache. Connectors now reference sourceId instead of direct sheetId."
+      - working: true
+        agent: "testing"
+        comment: "✅ CONNECTORS WITH NEW ARCHITECTURE WORKING: POST /connectors with sourceId, maskedColumns, filter, cacheMode creates connector with 32-char hex token. PATCH /connectors/:id successfully updates name (Finance Team → Finance Team v2). All CRUD operations work. Connectors properly reference sourceId. Filter applies correctly (dept=Finance returns only 2 rows: Bob + Eve)."
+
+  - task: "Public API with query params + caching + masking"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "GET /api/public/:token supports query params: q (search), sort, fields, limit, page, offset. Applies caching (fromCache flag), masking (masked columns show as X***Y), and filter. Returns {connector, department, count, total, fromCache, data}."
+      - working: true
+        agent: "testing"
+        comment: "✅ PUBLIC API QUERY PARAMS + MASKING + CACHING ALL WORKING: Basic call returns 2 Finance dept rows with email and salary properly masked (e.g., 'b***m', '8***0'). ?limit=1 returns count=1, total=2. ?sort=-name returns Eve first (descending). ?fields=id,name returns only those keys. ?q=eve returns only Eve row. Cache mode: first call fromCache=false, second call fromCache=true. All query params working perfectly. Masking verified working."
+
+  - task: "Governance (rotate-token, revoke, unrevoke, expiry)"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "POST /api/connectors/:id/rotate-token generates new token, old becomes invalid. POST /api/connectors/:id/revoke sets revoked=true, public API returns 401. POST /api/connectors/:id/unrevoke restores access. PATCH with expiresAt (past date) makes token return 401 expired."
+      - working: true
+        agent: "testing"
+        comment: "✅ GOVERNANCE ALL WORKING: rotate-token generates new token, old token returns 401, new token works (200). revoke makes public API return 401 'Token has been revoked'. unrevoke restores access (200). Setting expiresAt to past date returns 401 'Token expired'. Setting expiresAt to null restores access. All governance features working perfectly."
+
+  - task: "Generators (MCP, OpenAPI, audit)"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "GET /api/connectors/:id/mcp returns Node.js MCP server code (text/plain) with @modelcontextprotocol/sdk imports. GET /api/connectors/:id/openapi returns JSON with openapi:3.1.0. GET /api/connectors/:id/audit returns activity filtered for connector."
+      - working: true
+        agent: "testing"
+        comment: "✅ GENERATORS ALL WORKING: GET /mcp returns text/plain with @modelcontextprotocol/sdk imports (2327 chars). GET /openapi returns JSON with openapi:3.1.0 and paths object. GET /audit returns audit array with 18 entries including api_call actions. All generators produce proper output."
+
+  - task: "Enhanced stats endpoint"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "GET /api/stats returns: connectorsCount, sourcesCount, totalCalls, activeCount, byDepartment, timeseries (14 entries with {date,calls}), callsByDept, recentActivity."
+      - working: true
+        agent: "testing"
+        comment: "✅ ENHANCED STATS WORKING: Returns all required fields: connectorsCount (1), sourcesCount (2), totalCalls (10), activeCount, byDepartment object, timeseries array with exactly 14 entries, callsByDept object, recentActivity array. All aggregations working correctly."
+
 frontend:
   - task: "Landing + auth + dashboard + new-connector flow + connector detail (test console, Apps Script, config)"
     implemented: true
@@ -211,20 +316,67 @@ test_plan:
 agent_communication:
   - agent: "main"
     message: |
-      Initial MVP shipped. Please test the BACKEND only. Key flow to verify:
-      1) POST /api/auth/signup creates user and returns JWT.
-      2) POST /api/auth/login validates credentials.
-      3) GET /api/auth/me with Bearer token returns user.
-      4) POST /api/sheets/parse with a public Google Sheets URL returns columns/preview/rowCount.
-         Sample URL that works: https://docs.google.com/spreadsheets/d/1zT-RFK8gZWLwjwDp_dxhdYLeKHGn--Ke0pQ7H5LP00g/edit?usp=sharing
-         (If that's unavailable, use any sheet you create and share "Anyone with the link, Viewer").
-      5) POST /api/connectors (authed) creates a connector with token.
-      6) GET /api/public/{token} returns the JSON with filtered/selected columns. No auth required.
-      7) GET /api/connectors/:id/script returns Apps Script code (text/plain).
-      8) GET /api/stats returns KPIs.
-      9) DELETE /api/connectors/:id removes connector and subsequent /api/public/{token} returns 401.
-      All routes are in /app/app/api/[[...path]]/route.js. Base URL: use NEXT_PUBLIC_BASE_URL from /app/.env.
-      MongoDB DB_NAME=sheetflow_ai, collections: users, connectors, activity. UUIDs only (no ObjectId leakage).
+      BATCH 1 SHIPPED. Major architecture change — please re-test the BACKEND end-to-end.
+
+      NEW ARCHITECTURE:
+        - "Sources" collection: a source can be google_sheet | xlsx_upload | csv_upload.
+          Uploads store the parsed columns+rows as snapshot in MongoDB.
+        - "Connectors" (scoped views) now reference sourceId instead of holding sheetId directly.
+          They have: cacheMode (live|cached), cacheTTLSeconds, maskedColumns, expiresAt, revoked.
+        - Public API GET /api/public/{token} supports query params (q, sort, fields, page, limit, offset)
+          and applies caching + masking + filter + governance (revoked/expired).
+
+      KEY FLOWS TO VERIFY:
+
+      1) AUTH:
+         - POST /api/auth/signup, /auth/login, GET /auth/me — same as before.
+         - POST /api/auth/forgot {email} → returns {resetUrl} (since email isn't wired).
+         - POST /api/auth/reset {token, password} → resets password; old password no longer works.
+
+      2) SOURCES:
+         - POST /api/sources {type: "google_sheet", name, url} → 200 with source.
+         - POST /api/sources {type: "xlsx_upload" OR "csv_upload", name, fileName, columns:[{id,name,type}], rows:[[...]]} → 200.
+         - GET /api/sources → list (scoped to user).
+         - GET /api/sources/:id → returns source + preview (5 rows).
+         - DELETE /api/sources/:id → 200.
+
+      3) CONNECTORS (require sourceId now):
+         - POST /api/connectors {sourceId, name, department, columns, filter, maskedColumns, cacheMode, cacheTTLSeconds, expiresAt}
+           → returns connector with new 32-hex token.
+         - GET /api/connectors, GET /api/connectors/:id, DELETE /api/connectors/:id.
+         - PATCH /api/connectors/:id with updatable fields → connector updated, cache cleared.
+         - POST /api/connectors/:id/rotate-token → token changes, old URL no longer works.
+         - POST /api/connectors/:id/revoke → status=revoked; GET /public/{token} returns 401.
+         - POST /api/connectors/:id/unrevoke → restores.
+         - POST /api/connectors/:id/sync → clears cache.
+         - GET /api/connectors/:id/script → Apps Script (text/plain).
+         - GET /api/connectors/:id/mcp → Node.js MCP server code (text/plain) containing @modelcontextprotocol/sdk imports.
+         - GET /api/connectors/:id/openapi → JSON with openapi:"3.1.0".
+         - GET /api/connectors/:id/audit → activity items filtered for this connector.
+
+      4) PUBLIC API + QUERY PARAMS:
+         - GET /api/public/{token} (no auth) → JSON with {connector, department, count, total, fromCache, data:[]}.
+         - GET /api/public/{token}?limit=2 → only 2 rows.
+         - GET /api/public/{token}?sort=-<numeric_col> → sorted desc.
+         - GET /api/public/{token}?fields=col1,col2 → only those keys returned.
+         - GET /api/public/{token}?q=<substring> → substring search across all fields.
+         - For cached connector: first call fromCache=false, second call within TTL → fromCache=true.
+         - Masked columns: values appear like J***e instead of full string.
+         - Revoked/expired → 401.
+         - Rate limit: 120/min per token → 429 after exceeded.
+
+      5) UPLOAD SOURCE FLOW (csv_upload):
+         Submit a sample like:
+           { type:"csv_upload", name:"Test CSV", fileName:"x.csv",
+             columns:[{id:"col0",name:"id",type:"string"},{id:"col1",name:"email",type:"string"}],
+             rows:[[1,"a@b.com"],[2,"c@d.com"]] }
+         Then create a connector with maskedColumns:["email"]. GET /public/{token} → email should be masked.
+
+      6) STATS (/api/stats):
+         - Returns: connectorsCount, sourcesCount, totalCalls, activeCount, byDepartment, timeseries (14 entries with {date,calls}), callsByDept, recentActivity.
+
+      All under /app/app/api/[[...path]]/route.js. Base URL = NEXT_PUBLIC_BASE_URL. DB_NAME=sheetflow_ai.
+      Collections: users, sources, connectors, cache, activity. UUIDs only.
   - agent: "testing"
     message: |
       🎉 BACKEND TESTING COMPLETE - ALL TESTS PASSED (20/20 - 100%)
@@ -251,3 +403,73 @@ agent_communication:
       
       Test file: /app/backend_test.py
       All backend tasks marked as working=true, needs_retesting=false.
+  - agent: "testing"
+    message: |
+      🎉 BATCH 1 COMPREHENSIVE BACKEND TESTING COMPLETE - ALL TESTS PASSED (37/37 - 100%)
+      
+      Executed comprehensive test suite covering ALL new architecture features:
+      
+      ✅ HEALTH (1/1): Health check endpoint working
+      
+      ✅ AUTH FLOW (10/10): 
+         - Signup with JWT token generation
+         - Duplicate signup prevention (409)
+         - Login with valid credentials
+         - Wrong password rejection (401)
+         - /me with Bearer token (200)
+         - /me without token (401)
+         - Forgot password (returns resetUrl with token)
+         - Reset password (old password fails, new works)
+      
+      ✅ SOURCES (5/5):
+         - CSV upload with columns+rows snapshot
+         - Google Sheets parsing (public sheet)
+         - List sources (scoped by user)
+         - Get source by ID with preview (5 rows)
+         - Invalid GS URL returns 400
+      
+      ✅ CONNECTORS (4/4):
+         - Create with sourceId, maskedColumns, filter, cacheMode
+         - List connectors
+         - Get by ID
+         - PATCH updates (name change verified)
+      
+      ✅ PUBLIC API - THE MAGIC (6/6):
+         - Basic call: Filter works (dept=Finance → 2 rows: Bob + Eve)
+         - Masking works: email='b***m', salary='8***0'
+         - ?limit=1 → count=1, total=2
+         - ?sort=-name → Eve first (descending)
+         - ?fields=id,name → only those keys
+         - ?q=eve → substring search works
+         - Cache mode: fromCache toggles false→true correctly
+      
+      ✅ GOVERNANCE (4/4):
+         - rotate-token: old token→401, new token→200
+         - revoke: public API→401 "Token has been revoked"
+         - unrevoke: restores access→200
+         - expiresAt: past date→401 "Token expired", null→restored
+      
+      ✅ GENERATORS (4/4):
+         - Apps Script: text/plain with doGet, token (1949 chars)
+         - MCP: @modelcontextprotocol/sdk imports (2327 chars)
+         - OpenAPI: JSON with openapi:3.1.0, paths
+         - Audit: 18 entries with api_call actions
+      
+      ✅ STATS (1/1):
+         - All fields present: connectorsCount, sourcesCount, totalCalls, activeCount
+         - byDepartment, timeseries (14 entries), callsByDept, recentActivity
+      
+      ✅ CLEANUP (2/2):
+         - Delete connector → token becomes invalid (401)
+         - Delete source → 200
+      
+      CRITICAL VERIFICATIONS:
+      ✅ Masking actually replaces values (verified: 'b***m', '8***0')
+      ✅ Query params filter/sort/limit work correctly
+      ✅ Cache flag toggles between live/cached calls (false→true)
+      ✅ rotate-token invalidates old token (401)
+      ✅ revoke + unrevoke work properly (401→200)
+      ✅ Filter applies correctly (dept=Finance returns exactly 2 rows)
+      
+      Test file: /app/backend_test.py
+      All backend tasks updated with working=true, needs_retesting=false.

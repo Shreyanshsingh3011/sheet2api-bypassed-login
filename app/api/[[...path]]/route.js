@@ -18,82 +18,50 @@ async function getDb() {
   return cachedClient.db(DB_NAME)
 }
 
-function json(data, status = 200) {
-  return NextResponse.json(data, { status, headers: { 'Access-Control-Allow-Origin': '*' } })
-}
-
-function err(message, status = 400) {
-  return json({ error: message }, status)
-}
+const j = (data, status = 200) => NextResponse.json(data, { status, headers: { 'Access-Control-Allow-Origin': '*' } })
+const e = (m, s = 400) => j({ error: m }, s)
 
 export async function OPTIONS() {
-  return new NextResponse(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization' } })
+  return new NextResponse(null, { status: 204, headers: {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,PATCH,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+  }})
 }
 
-// ------- Sheet utilities -------
-function extractSheetId(url) {
-  if (!url) return null
-  const m = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)
-  return m ? m[1] : null
-}
-function extractGid(url) {
-  if (!url) return '0'
-  const m = url.match(/[?&#]gid=([0-9]+)/)
-  return m ? m[1] : '0'
-}
+// ───────── Google Sheets utils ─────────
+function extractSheetId(url) { const m = String(url||'').match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/); return m ? m[1] : null }
+function extractGid(url) { const m = String(url||'').match(/[?&#]gid=([0-9]+)/); return m ? m[1] : '0' }
 
 async function fetchGvizJson(sheetId, gid) {
   const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json&gid=${gid}`
   const res = await fetch(url, { cache: 'no-store', redirect: 'follow' })
-  if (!res.ok) {
-    throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure it's shared as "Anyone with the link can view".`)
-  }
+  if (!res.ok) throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure share = "Anyone with link, Viewer".`)
   const text = await res.text()
-  const jsonStart = text.indexOf('{')
-  const jsonEnd = text.lastIndexOf('}')
-  if (jsonStart === -1 || jsonEnd === -1) {
-    throw new Error('Invalid response from Google. Make sure the sheet link is public (Anyone with the link).')
-  }
-  let parsed
-  try {
-    parsed = JSON.parse(text.substring(jsonStart, jsonEnd + 1))
-  } catch (e) {
-    throw new Error('Could not parse Google Sheets response.')
-  }
-  if (parsed.status === 'error') {
-    const msg = parsed.errors?.[0]?.detailed_message || parsed.errors?.[0]?.message || 'unknown'
-    throw new Error('Sheet error: ' + msg.replace(/<[^>]+>/g, ''))
-  }
-  return parsed
+  const a = text.indexOf('{'), b = text.lastIndexOf('}')
+  if (a === -1 || b === -1) throw new Error('Invalid response from Google. Make sure the sheet link is public.')
+  const p = JSON.parse(text.substring(a, b + 1))
+  if (p.status === 'error') throw new Error('Sheet error: ' + (p.errors?.[0]?.detailed_message || 'unknown').replace(/<[^>]+>/g, ''))
+  return p
 }
 
-function parseSheet(gvizData) {
-  const table = gvizData.table || {}
-  const cols = (table.cols || []).map((c, i) => ({
-    id: c.id || `col${i}`,
-    name: (c.label && c.label.trim()) || c.id || `Column ${i + 1}`,
-    type: c.type || 'string',
-  }))
-  let rows = (table.rows || []).map(r => (r.c || []).map(cell => (cell ? cell.v : null)))
-  // If header labels are empty/blank, treat first row as header
+function parseGviz(g) {
+  const t = g.table || {}
+  const cols = (t.cols || []).map((c, i) => ({ id: c.id || `col${i}`, name: (c.label && c.label.trim()) || c.id || `Column ${i+1}`, type: c.type || 'string' }))
+  let rows = (t.rows || []).map(r => (r.c || []).map(c => c ? c.v : null))
   const labelsEmpty = cols.every(c => !c.name || /^col\d+$|^Column \d+$/.test(c.name) || c.name === c.id)
   if (labelsEmpty && rows.length > 0) {
-    const headerRow = rows.shift()
-    headerRow.forEach((h, i) => { if (h && cols[i]) cols[i].name = String(h) })
+    const h = rows.shift()
+    h.forEach((v, i) => { if (v && cols[i]) cols[i].name = String(v) })
   }
   return { columns: cols, rows, rowCount: rows.length }
 }
 
-function rowToObject(columns, row, allowedNames) {
-  const o = {}
-  columns.forEach((c, i) => {
-    if (!allowedNames || allowedNames.length === 0 || allowedNames.includes(c.name)) {
-      o[c.name] = row[i] === undefined ? null : row[i]
-    }
-  })
-  return o
+const rowToObj = (cols, row, allowed) => {
+  const o = {}; cols.forEach((c, i) => { if (!allowed || !allowed.length || allowed.includes(c.name)) o[c.name] = row[i] ?? null }); return o
 }
 
+// ───────── Query helpers ─────────
 function applyFilter(records, filter) {
   if (!filter || !filter.column || !filter.operator) return records
   const { column, operator, value } = filter
@@ -111,295 +79,504 @@ function applyFilter(records, filter) {
   })
 }
 
-// ------- Auth -------
-function signToken(user) {
-  return jwt.sign({ id: user.id, email: user.email, name: user.name, role: user.role || 'admin' }, JWT_SECRET, { expiresIn: '30d' })
+function applyQueryParams(records, sp) {
+  // Search (q): substring match across all fields
+  const q = sp.get('q')
+  if (q) { const s = q.toLowerCase(); records = records.filter(r => Object.values(r).some(v => String(v ?? '').toLowerCase().includes(s))) }
+  // ?field=value style filtering
+  for (const [k, v] of sp.entries()) {
+    if (['q','sort','page','limit','offset','fields','format'].includes(k)) continue
+    records = records.filter(r => String(r[k] ?? '').toLowerCase() === String(v).toLowerCase())
+  }
+  // Sort
+  const sort = sp.get('sort')
+  if (sort) {
+    const desc = sort.startsWith('-')
+    const key = desc ? sort.slice(1) : sort
+    records = [...records].sort((a, b) => {
+      const x = a[key], y = b[key]
+      if (typeof x === 'number' && typeof y === 'number') return desc ? y - x : x - y
+      return desc ? String(y ?? '').localeCompare(String(x ?? '')) : String(x ?? '').localeCompare(String(y ?? ''))
+    })
+  }
+  // Fields projection (intersect with allowed)
+  const fields = sp.get('fields')
+  if (fields) {
+    const ff = fields.split(',').map(s => s.trim()).filter(Boolean)
+    records = records.map(r => { const o = {}; ff.forEach(f => { if (f in r) o[f] = r[f] }); return o })
+  }
+  // Pagination
+  const limit = Math.min(parseInt(sp.get('limit') || '0') || 0, 5000)
+  const page = parseInt(sp.get('page') || '0') || 0
+  const offset = parseInt(sp.get('offset') || '0') || 0
+  const total = records.length
+  if (limit > 0) {
+    const start = page > 0 ? (page - 1) * limit : offset
+    records = records.slice(start, start + limit)
+  }
+  return { records, total }
 }
+
+function applyMasking(records, masked) {
+  if (!masked?.length) return records
+  return records.map(r => {
+    const o = { ...r }
+    masked.forEach(col => {
+      if (col in o && o[col] !== null && o[col] !== undefined && o[col] !== '') {
+        const s = String(o[col])
+        o[col] = s.length <= 2 ? '***' : s[0] + '***' + s.slice(-1)
+      }
+    })
+    return o
+  })
+}
+
+// ───────── Auth ─────────
+const signToken = u => jwt.sign({ id: u.id, email: u.email, name: u.name, role: u.role || 'admin' }, JWT_SECRET, { expiresIn: '30d' })
 function getAuthUser(request) {
   const auth = request.headers.get('authorization') || ''
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null
   if (!token) return null
   try { return jwt.verify(token, JWT_SECRET) } catch { return null }
 }
+const logAct = async (db, userId, action, meta = {}) => { await db.collection('activity').insertOne({ id: uuidv4(), userId, action, meta, createdAt: new Date().toISOString() }) }
 
-async function logActivity(db, userId, action, meta = {}) {
-  await db.collection('activity').insertOne({
-    id: uuidv4(), userId, action, meta, createdAt: new Date().toISOString(),
-  })
-}
-
-function generateAppsScript(connector) {
-  const { token, name, department, sheetId, gid, columns, filter } = connector
-  const cols = JSON.stringify(columns || [])
-  const filt = JSON.stringify(filter || {})
+// ───────── Generators ─────────
+function gen_appsScript(c) {
+  const cols = JSON.stringify(c.columns || []), filt = JSON.stringify(c.filter || {}), mask = JSON.stringify(c.maskedColumns || [])
   return `/**
  * SheetFlow AI - Auto-generated Apps Script
- * Connector: ${name} (${department})
- *
- * Deployment Steps:
- * 1. In your Google Sheet: Extensions > Apps Script
- * 2. Paste this entire code, save.
- * 3. Deploy > New deployment > Type: Web app
- *    - Execute as: Me
- *    - Who has access: Anyone
- * 4. Authorize and copy the Web app URL.
- * 5. Call:  YOUR_WEBAPP_URL?token=${token}
+ * Connector: ${c.name} (${c.department})
+ * Deploy: Extensions > Apps Script > Deploy > New deployment > Web app
+ *   Execute as: Me, Who has access: Anyone
+ * Then call: WEBAPP_URL?token=${c.token}
  */
-
-const SECRET_TOKEN = '${token}';
-const SHEET_ID = '${sheetId}';
-const GID = '${gid}';
-const COLUMNS = ${cols};
-const FILTER = ${filt};
-
-function doGet(e) {
-  const token = (e && e.parameter && e.parameter.token) || '';
-  if (token !== SECRET_TOKEN) {
-    return _json({ error: 'Unauthorized' });
-  }
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  let sheet = ss.getSheets().filter(function(s){ return String(s.getSheetId()) === String(GID); })[0] || ss.getSheets()[0];
-  const values = sheet.getDataRange().getValues();
-  if (values.length < 2) return _json({ connector: '${name}', department: '${department}', count: 0, data: [], generated_at: new Date().toISOString() });
-  const headers = values[0].map(String);
-  const rows = values.slice(1);
-  let data = rows.map(function(r){
-    var o = {};
-    headers.forEach(function(h, i){
-      if (COLUMNS.length === 0 || COLUMNS.indexOf(h) !== -1) o[h] = r[i];
-    });
-    return o;
-  });
-  if (FILTER && FILTER.column && FILTER.operator) {
-    data = data.filter(function(r){ return _matches(r[FILTER.column], FILTER.operator, FILTER.value); });
-  }
-  return _json({
-    connector: '${name}',
-    department: '${department}',
-    count: data.length,
-    generated_at: new Date().toISOString(),
-    data: data
-  });
+const SECRET_TOKEN='${c.token}', SHEET_ID='${c.sheetId}', GID='${c.gid || '0'}';
+const COLUMNS=${cols}, FILTER=${filt}, MASK=${mask};
+function doGet(e){
+  if(((e&&e.parameter&&e.parameter.token)||'')!==SECRET_TOKEN) return _j({error:'Unauthorized'});
+  var ss=SpreadsheetApp.openById(SHEET_ID);
+  var sh=ss.getSheets().filter(function(s){return String(s.getSheetId())===String(GID);})[0]||ss.getSheets()[0];
+  var v=sh.getDataRange().getValues(); if(v.length<2) return _j({count:0,data:[]});
+  var h=v[0].map(String), rows=v.slice(1);
+  var data=rows.map(function(r){var o={};h.forEach(function(k,i){if(!COLUMNS.length||COLUMNS.indexOf(k)!==-1)o[k]=r[i]});return o;});
+  if(FILTER&&FILTER.column&&FILTER.operator) data=data.filter(function(r){return _m(r[FILTER.column],FILTER.operator,FILTER.value);});
+  if(MASK.length) data=data.map(function(r){MASK.forEach(function(k){if(r[k]!=null){var s=String(r[k]);r[k]=s.length<=2?'***':s[0]+'***'+s.slice(-1);}});return r;});
+  return _j({connector:'${c.name}',department:'${c.department}',count:data.length,generated_at:new Date().toISOString(),data:data});
 }
-
-function _matches(v, op, val) {
-  if (op === 'equals') return String(v) === String(val);
-  if (op === 'not_equals') return String(v) !== String(val);
-  if (op === 'contains') return String(v||'').toLowerCase().indexOf(String(val||'').toLowerCase()) !== -1;
-  if (op === 'greater_than') return Number(v) > Number(val);
-  if (op === 'less_than') return Number(v) < Number(val);
-  if (op === 'not_empty') return v !== null && v !== '' && v !== undefined;
-  return true;
-}
-
-function _json(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj, null, 2)).setMimeType(ContentService.MimeType.JSON);
-}
+function _m(v,o,V){switch(o){case'equals':return String(v)===String(V);case'not_equals':return String(v)!==String(V);case'contains':return String(v||'').toLowerCase().indexOf(String(V||'').toLowerCase())!==-1;case'greater_than':return Number(v)>Number(V);case'less_than':return Number(v)<Number(V);case'not_empty':return v!=null&&v!=='';default:return true;}}
+function _j(o){return ContentService.createTextOutput(JSON.stringify(o,null,2)).setMimeType(ContentService.MimeType.JSON);}
 `
 }
 
-// ------- Main handler -------
+function gen_mcpServer(c, baseUrl) {
+  const apiUrl = `${baseUrl}/api/public/${c.token}`
+  const slug = c.name.toLowerCase().replace(/[^a-z0-9]+/g, '_')
+  return `#!/usr/bin/env node
+/**
+ * SheetFlow AI - MCP Server for "${c.name}" (${c.department})
+ *
+ * Setup:
+ *   1. Save this file as sheetflow-${slug}.mjs
+ *   2. Run: npm install @modelcontextprotocol/sdk
+ *   3. Add to Claude Desktop's claude_desktop_config.json:
+ *        {
+ *          "mcpServers": {
+ *            "${slug}": {
+ *              "command": "node",
+ *              "args": ["/absolute/path/to/sheetflow-${slug}.mjs"]
+ *            }
+ *          }
+ *        }
+ *   4. Restart Claude Desktop. Your AI can now query this data.
+ */
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+const API_URL = '${apiUrl}';
+const NAME = '${c.name}';
+
+const server = new Server(
+  { name: 'sheetflow-${slug}', version: '1.0.0' },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'query_${slug}',
+      description: 'Query data from the "' + NAME + '" SheetFlow connector. Supports search, filtering, sorting, and pagination.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          search: { type: 'string', description: 'Substring search across all fields' },
+          sort: { type: 'string', description: 'Column to sort by; prefix with "-" for descending' },
+          limit: { type: 'number', description: 'Max rows to return' }
+        }
+      }
+    }
+  ]
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const args = req.params.arguments || {};
+  const url = new URL(API_URL);
+  if (args.search) url.searchParams.set('q', args.search);
+  if (args.sort) url.searchParams.set('sort', args.sort);
+  if (args.limit) url.searchParams.set('limit', String(args.limit));
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+console.error('SheetFlow MCP server "${slug}" running.');
+`
+}
+
+function gen_openApi(c, baseUrl) {
+  const cols = c.columns?.length ? c.columns : ['*']
+  const props = {}
+  ;(c.columns || []).forEach(name => { props[name] = { type: 'string', nullable: true } })
+  return {
+    openapi: '3.1.0',
+    info: { title: `${c.name} API`, description: `Auto-generated by SheetFlow AI for ${c.department}.`, version: '1.0.0' },
+    servers: [{ url: baseUrl }],
+    paths: {
+      [`/api/public/${c.token}`]: {
+        get: {
+          summary: `Fetch ${c.name} data`,
+          description: `Returns ${c.department} records${c.filter?.column ? ` filtered where ${c.filter.column} ${c.filter.operator} ${c.filter.value}` : ''}.`,
+          parameters: [
+            { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Substring search across all fields' },
+            { name: 'sort', in: 'query', schema: { type: 'string' }, description: 'Column to sort by; prefix - for desc' },
+            { name: 'fields', in: 'query', schema: { type: 'string' }, description: 'Comma-separated columns to return' },
+            { name: 'limit', in: 'query', schema: { type: 'integer' }, description: 'Page size (max 5000)' },
+            { name: 'page', in: 'query', schema: { type: 'integer' }, description: 'Page number (1-based)' },
+            { name: 'offset', in: 'query', schema: { type: 'integer' }, description: 'Offset (alternative to page)' },
+          ],
+          responses: {
+            '200': {
+              description: 'Success',
+              content: { 'application/json': { schema: {
+                type: 'object',
+                properties: {
+                  connector: { type: 'string' }, department: { type: 'string' }, count: { type: 'integer' }, total: { type: 'integer' },
+                  generated_at: { type: 'string', format: 'date-time' },
+                  data: { type: 'array', items: { type: 'object', properties: props } }
+                }
+              }}}
+            },
+            '401': { description: 'Invalid or revoked token' },
+            '429': { description: 'Rate limit / quota exceeded' },
+          }
+        }
+      }
+    }
+  }
+}
+
+// ───────── Cache ─────────
+async function getCachedOrLive(db, connector, source) {
+  if (connector.cacheMode === 'cached') {
+    const ttl = (connector.cacheTTLSeconds || 300) * 1000
+    const cached = await db.collection('cache').findOne({ tokenId: connector.id })
+    if (cached && (Date.now() - new Date(cached.generatedAt).getTime()) < ttl) {
+      return { columns: cached.columns, rows: cached.rows, fromCache: true }
+    }
+  }
+  let columns, rows
+  if (source.type === 'google_sheet') {
+    const g = await fetchGvizJson(source.sheetId, source.gid || '0')
+    const p = parseGviz(g); columns = p.columns; rows = p.rows
+  } else {
+    columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
+  }
+  if (connector.cacheMode === 'cached') {
+    await db.collection('cache').updateOne({ tokenId: connector.id }, { $set: { tokenId: connector.id, columns, rows, generatedAt: new Date().toISOString() } }, { upsert: true })
+  }
+  return { columns, rows, fromCache: false }
+}
+
+const stripDoc = d => { if (!d) return d; const { _id, passwordHash, resetToken, resetExpires, ...rest } = d; return rest }
+
 async function handler(request, { params }) {
   const path = (params?.path || []).join('/')
   const method = request.method
   const db = await getDb()
 
   try {
-    // -------- Health --------
-    if (path === '' || path === 'health') {
-      return json({ status: 'ok', service: 'SheetFlow AI', time: new Date().toISOString() })
-    }
+    if (path === '' || path === 'health') return j({ status: 'ok', service: 'SheetFlow AI', time: new Date().toISOString() })
 
-    // -------- Auth --------
+    // ── AUTH ──
     if (path === 'auth/signup' && method === 'POST') {
       const { email, password, name } = await request.json()
-      if (!email || !password) return err('Email and password required')
-      const existing = await db.collection('users').findOne({ email: email.toLowerCase() })
-      if (existing) return err('Email already registered', 409)
-      const hash = await bcrypt.hash(password, 10)
-      const user = {
-        id: uuidv4(),
-        email: email.toLowerCase(),
-        name: name || email.split('@')[0],
-        passwordHash: hash,
-        role: 'admin',
-        createdAt: new Date().toISOString(),
-      }
-      await db.collection('users').insertOne(user)
-      const token = signToken(user)
-      await logActivity(db, user.id, 'signup', {})
-      return json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } })
+      if (!email || !password) return e('Email and password required')
+      const ex = await db.collection('users').findOne({ email: email.toLowerCase() })
+      if (ex) return e('Email already registered', 409)
+      const u = { id: uuidv4(), email: email.toLowerCase(), name: name || email.split('@')[0], passwordHash: await bcrypt.hash(password, 10), role: 'admin', createdAt: new Date().toISOString() }
+      await db.collection('users').insertOne(u)
+      const token = signToken(u); await logAct(db, u.id, 'signup', {})
+      return j({ token, user: { id: u.id, email: u.email, name: u.name, role: u.role } })
     }
-
     if (path === 'auth/login' && method === 'POST') {
       const { email, password } = await request.json()
-      if (!email || !password) return err('Email and password required')
-      const user = await db.collection('users').findOne({ email: email.toLowerCase() })
-      if (!user) return err('Invalid credentials', 401)
-      const ok = await bcrypt.compare(password, user.passwordHash)
-      if (!ok) return err('Invalid credentials', 401)
-      const token = signToken(user)
-      await logActivity(db, user.id, 'login', {})
-      return json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } })
+      const u = await db.collection('users').findOne({ email: (email || '').toLowerCase() })
+      if (!u || !(await bcrypt.compare(password || '', u.passwordHash))) return e('Invalid credentials', 401)
+      const token = signToken(u); await logAct(db, u.id, 'login', {})
+      return j({ token, user: { id: u.id, email: u.email, name: u.name, role: u.role } })
     }
-
     if (path === 'auth/me' && method === 'GET') {
-      const u = getAuthUser(request)
-      if (!u) return err('Unauthorized', 401)
-      return json({ user: u })
+      const u = getAuthUser(request); if (!u) return e('Unauthorized', 401); return j({ user: u })
+    }
+    if (path === 'auth/forgot' && method === 'POST') {
+      const { email } = await request.json()
+      const u = await db.collection('users').findOne({ email: (email || '').toLowerCase() })
+      // Always return success-ish to prevent enumeration, but only generate token if user exists
+      if (!u) return j({ ok: true, resetUrl: null, note: 'If an account exists, a reset link was generated.' })
+      const tok = crypto.randomBytes(24).toString('hex')
+      await db.collection('users').updateOne({ id: u.id }, { $set: { resetToken: tok, resetExpires: new Date(Date.now() + 30 * 60 * 1000).toISOString() } })
+      const base = process.env.NEXT_PUBLIC_BASE_URL || ''
+      return j({ ok: true, resetUrl: `${base}/?reset=${tok}`, note: 'Email delivery not configured yet — copy this link to reset.' })
+    }
+    if (path === 'auth/reset' && method === 'POST') {
+      const { token, password } = await request.json()
+      if (!token || !password) return e('Missing token or password')
+      const u = await db.collection('users').findOne({ resetToken: token })
+      if (!u || !u.resetExpires || new Date(u.resetExpires) < new Date()) return e('Invalid or expired reset link', 400)
+      await db.collection('users').updateOne({ id: u.id }, { $set: { passwordHash: await bcrypt.hash(password, 10) }, $unset: { resetToken: '', resetExpires: '' } })
+      await logAct(db, u.id, 'password_reset', {})
+      return j({ ok: true })
     }
 
-    // -------- Sheet parsing (preview, no auth required so user can try) --------
+    // ── Legacy sheet parse (still used by some flows) ──
     if (path === 'sheets/parse' && method === 'POST') {
       const { url } = await request.json()
-      const sheetId = extractSheetId(url)
-      if (!sheetId) return err('Invalid Google Sheets URL. Use the link from your browser bar.')
+      const sheetId = extractSheetId(url); if (!sheetId) return e('Invalid Google Sheets URL.')
       const gid = extractGid(url)
-      const gviz = await fetchGvizJson(sheetId, gid)
-      const parsed = parseSheet(gviz)
-      return json({
-        sheetId,
-        gid,
-        sheetName: gviz.table?.parsedNumHeaders !== undefined ? 'Sheet' : 'Sheet',
-        columns: parsed.columns,
-        rowCount: parsed.rowCount,
-        preview: parsed.rows.slice(0, 5).map(r => rowToObject(parsed.columns, r)),
-      })
+      const g = await fetchGvizJson(sheetId, gid); const p = parseGviz(g)
+      return j({ sheetId, gid, columns: p.columns, rowCount: p.rowCount, preview: p.rows.slice(0, 5).map(r => rowToObj(p.columns, r)) })
     }
 
-    // -------- Connectors (auth required) --------
-    const authUser = getAuthUser(request)
+    const u = getAuthUser(request)
 
+    // ── SOURCES ──
+    if (path === 'sources' && method === 'GET') {
+      if (!u) return e('Unauthorized', 401)
+      const items = await db.collection('sources').find({ userId: u.id }).sort({ createdAt: -1 }).toArray()
+      return j({ sources: items.map(s => { const x = stripDoc(s); delete x.snapshot; return x }) })
+    }
+    if (path === 'sources' && method === 'POST') {
+      if (!u) return e('Unauthorized', 401)
+      const b = await request.json()
+      let src = { id: uuidv4(), userId: u.id, name: b.name || 'Untitled source', type: b.type, createdAt: new Date().toISOString() }
+      if (b.type === 'google_sheet') {
+        const sheetId = extractSheetId(b.url); if (!sheetId) return e('Invalid Google Sheets URL')
+        const gid = extractGid(b.url)
+        // verify
+        const g = await fetchGvizJson(sheetId, gid); const p = parseGviz(g)
+        src = { ...src, url: b.url, sheetId, gid, columnsMeta: p.columns, rowCount: p.rowCount }
+      } else if (b.type === 'xlsx_upload' || b.type === 'csv_upload') {
+        if (!Array.isArray(b.columns) || !Array.isArray(b.rows)) return e('Missing columns/rows')
+        src = { ...src, fileName: b.fileName || '', columnsMeta: b.columns, rowCount: b.rows.length,
+          snapshot: { columns: b.columns, rows: b.rows } }
+      } else return e('Unknown source type')
+      await db.collection('sources').insertOne(src)
+      await logAct(db, u.id, 'source_created', { sourceId: src.id, type: src.type, name: src.name })
+      return j({ source: { ...stripDoc(src), snapshot: undefined } })
+    }
+    const srcMatch = path.match(/^sources\/([^/]+)$/)
+    if (srcMatch) {
+      if (!u) return e('Unauthorized', 401)
+      const id = srcMatch[1]
+      const src = await db.collection('sources').findOne({ id, userId: u.id })
+      if (!src) return e('Not found', 404)
+      if (method === 'GET') {
+        // return preview from columnsMeta + first 5 rows
+        let preview = []
+        if (src.type === 'google_sheet') {
+          try { const g = await fetchGvizJson(src.sheetId, src.gid); const p = parseGviz(g); preview = p.rows.slice(0,5).map(r => rowToObj(p.columns, r)) } catch {}
+        } else {
+          const cols = src.columnsMeta || []
+          preview = (src.snapshot?.rows || []).slice(0, 5).map(r => rowToObj(cols, r))
+        }
+        return j({ source: { ...stripDoc(src), snapshot: undefined }, preview })
+      }
+      if (method === 'DELETE') {
+        await db.collection('sources').deleteOne({ id, userId: u.id })
+        await logAct(db, u.id, 'source_deleted', { sourceId: id })
+        return j({ ok: true })
+      }
+    }
+
+    // ── CONNECTORS ──
     if (path === 'connectors' && method === 'GET') {
-      if (!authUser) return err('Unauthorized', 401)
-      const items = await db.collection('connectors').find({ userId: authUser.id }).sort({ createdAt: -1 }).toArray()
-      return json({ connectors: items.map(stripMongoId) })
+      if (!u) return e('Unauthorized', 401)
+      const items = await db.collection('connectors').find({ userId: u.id }).sort({ createdAt: -1 }).toArray()
+      return j({ connectors: items.map(stripDoc) })
     }
-
     if (path === 'connectors' && method === 'POST') {
-      if (!authUser) return err('Unauthorized', 401)
-      const body = await request.json()
-      const { name, department, sheetUrl, sheetId, gid, columns, filter, refreshFreq } = body
-      if (!name || !department || !sheetId) return err('Missing required fields')
+      if (!u) return e('Unauthorized', 401)
+      const b = await request.json()
+      if (!b.name || !b.department || !b.sourceId) return e('Missing required fields')
+      const src = await db.collection('sources').findOne({ id: b.sourceId, userId: u.id })
+      if (!src) return e('Source not found', 404)
       const token = crypto.randomBytes(16).toString('hex')
-      const connector = {
-        id: uuidv4(),
-        userId: authUser.id,
-        name,
-        department,
-        sheetUrl: sheetUrl || '',
-        sheetId,
-        gid: gid || '0',
-        columns: columns || [],
-        filter: filter || null,
-        refreshFreq: refreshFreq || 'realtime',
-        token,
-        status: 'active',
-        callCount: 0,
-        lastSyncAt: null,
+      const c = {
+        id: uuidv4(), userId: u.id, sourceId: src.id, sourceType: src.type, sourceName: src.name,
+        name: b.name, department: b.department,
+        sheetId: src.sheetId || null, gid: src.gid || '0',
+        columns: b.columns || [], filter: b.filter || null, maskedColumns: b.maskedColumns || [],
+        cacheMode: b.cacheMode || 'live', cacheTTLSeconds: b.cacheTTLSeconds || 300,
+        token, status: 'active', revoked: false, callCount: 0, lastSyncAt: null,
+        expiresAt: b.expiresAt || null,
         createdAt: new Date().toISOString(),
       }
-      await db.collection('connectors').insertOne(connector)
-      await logActivity(db, authUser.id, 'connector_created', { connectorId: connector.id, department, name })
-      return json({ connector: stripMongoId(connector) })
+      await db.collection('connectors').insertOne(c)
+      await logAct(db, u.id, 'connector_created', { connectorId: c.id, department: c.department, name: c.name })
+      return j({ connector: stripDoc(c) })
     }
 
-    const connectorMatch = path.match(/^connectors\/([^/]+)(?:\/(.+))?$/)
-    if (connectorMatch) {
-      const id = connectorMatch[1]
-      const sub = connectorMatch[2]
-      if (!authUser) return err('Unauthorized', 401)
-      const connector = await db.collection('connectors').findOne({ id, userId: authUser.id })
-      if (!connector) return err('Connector not found', 404)
+    const cm = path.match(/^connectors\/([^/]+)(?:\/(.+))?$/)
+    if (cm) {
+      if (!u) return e('Unauthorized', 401)
+      const id = cm[1], sub = cm[2]
+      const c = await db.collection('connectors').findOne({ id, userId: u.id })
+      if (!c) return e('Connector not found', 404)
+      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || ''
 
-      if (!sub && method === 'GET') {
-        return json({ connector: stripMongoId(connector) })
-      }
+      if (!sub && method === 'GET') return j({ connector: stripDoc(c) })
       if (!sub && method === 'DELETE') {
-        await db.collection('connectors').deleteOne({ id, userId: authUser.id })
-        await logActivity(db, authUser.id, 'connector_deleted', { connectorId: id })
-        return json({ ok: true })
+        await db.collection('connectors').deleteOne({ id, userId: u.id })
+        await db.collection('cache').deleteOne({ tokenId: id })
+        await logAct(db, u.id, 'connector_deleted', { connectorId: id })
+        return j({ ok: true })
       }
-      if (sub === 'script' && method === 'GET') {
-        const code = generateAppsScript(connector)
-        return new NextResponse(code, { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+      if (!sub && method === 'PATCH') {
+        const b = await request.json()
+        const allowed = ['name','department','columns','filter','maskedColumns','cacheMode','cacheTTLSeconds','expiresAt']
+        const upd = {}; allowed.forEach(k => { if (k in b) upd[k] = b[k] })
+        if (Object.keys(upd).length) await db.collection('connectors').updateOne({ id }, { $set: upd })
+        await db.collection('cache').deleteOne({ tokenId: id })
+        await logAct(db, u.id, 'connector_updated', { connectorId: id, fields: Object.keys(upd) })
+        const after = await db.collection('connectors').findOne({ id })
+        return j({ connector: stripDoc(after) })
+      }
+      if (sub === 'rotate-token' && method === 'POST') {
+        const newTok = crypto.randomBytes(16).toString('hex')
+        await db.collection('connectors').updateOne({ id }, { $set: { token: newTok } })
+        await logAct(db, u.id, 'token_rotated', { connectorId: id })
+        const after = await db.collection('connectors').findOne({ id })
+        return j({ connector: stripDoc(after) })
+      }
+      if (sub === 'revoke' && method === 'POST') {
+        await db.collection('connectors').updateOne({ id }, { $set: { revoked: true, status: 'revoked' } })
+        await logAct(db, u.id, 'connector_revoked', { connectorId: id })
+        return j({ ok: true })
+      }
+      if (sub === 'unrevoke' && method === 'POST') {
+        await db.collection('connectors').updateOne({ id }, { $set: { revoked: false, status: 'active' } })
+        await logAct(db, u.id, 'connector_unrevoked', { connectorId: id })
+        return j({ ok: true })
       }
       if (sub === 'sync' && method === 'POST') {
-        // "sync" just touches the timestamp; data is live-fetched from Google.
+        await db.collection('cache').deleteOne({ tokenId: id })
         await db.collection('connectors').updateOne({ id }, { $set: { lastSyncAt: new Date().toISOString() } })
-        await logActivity(db, authUser.id, 'connector_synced', { connectorId: id })
-        return json({ ok: true, lastSyncAt: new Date().toISOString() })
+        await logAct(db, u.id, 'connector_synced', { connectorId: id })
+        return j({ ok: true, lastSyncAt: new Date().toISOString() })
+      }
+      if (sub === 'script' && method === 'GET') {
+        return new NextResponse(gen_appsScript(c), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+      }
+      if (sub === 'mcp' && method === 'GET') {
+        return new NextResponse(gen_mcpServer(c, baseUrl), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
+      }
+      if (sub === 'openapi' && method === 'GET') {
+        return j(gen_openApi(c, baseUrl))
+      }
+      if (sub === 'audit' && method === 'GET') {
+        const items = await db.collection('activity').find({ userId: u.id, 'meta.connectorId': id }).sort({ createdAt: -1 }).limit(200).toArray()
+        return j({ audit: items.map(stripDoc) })
       }
     }
 
-    // -------- Stats / Activity --------
+    // ── STATS ──
     if (path === 'stats' && method === 'GET') {
-      if (!authUser) return err('Unauthorized', 401)
-      const connectors = await db.collection('connectors').find({ userId: authUser.id }).toArray()
-      const totalCalls = connectors.reduce((s, c) => s + (c.callCount || 0), 0)
-      const byDept = {}
-      connectors.forEach(c => { byDept[c.department] = (byDept[c.department] || 0) + 1 })
-      const activity = await db.collection('activity').find({ userId: authUser.id }).sort({ createdAt: -1 }).limit(10).toArray()
-      return json({
-        connectorsCount: connectors.length,
-        totalCalls,
-        activeCount: connectors.filter(c => c.status === 'active').length,
-        byDepartment: byDept,
-        recentActivity: activity.map(stripMongoId),
+      if (!u) return e('Unauthorized', 401)
+      const conns = await db.collection('connectors').find({ userId: u.id }).toArray()
+      const sources = await db.collection('sources').find({ userId: u.id }).toArray()
+      const totalCalls = conns.reduce((s, c) => s + (c.callCount || 0), 0)
+      const byDept = {}; conns.forEach(c => { byDept[c.department] = (byDept[c.department] || 0) + 1 })
+      const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString()
+      const recent = await db.collection('activity').find({ userId: u.id, action: 'api_call', createdAt: { $gte: since } }).toArray()
+      const dayMap = {}
+      for (let i = 13; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); const key = d.toISOString().slice(0, 10); dayMap[key] = 0 }
+      recent.forEach(r => { const k = r.createdAt.slice(0, 10); if (k in dayMap) dayMap[k]++ })
+      const timeseries = Object.entries(dayMap).map(([date, calls]) => ({ date: date.slice(5), calls }))
+      const callsByDept = {}
+      const allCalls = await db.collection('activity').find({ userId: u.id, action: 'api_call' }).toArray()
+      allCalls.forEach(a => { const c = conns.find(x => x.id === a.meta?.connectorId); if (c) callsByDept[c.department] = (callsByDept[c.department] || 0) + 1 })
+      const recentActivity = await db.collection('activity').find({ userId: u.id }).sort({ createdAt: -1 }).limit(10).toArray()
+      return j({
+        connectorsCount: conns.length, sourcesCount: sources.length, totalCalls,
+        activeCount: conns.filter(c => !c.revoked && c.status === 'active').length,
+        byDepartment: byDept, timeseries, callsByDept,
+        recentActivity: recentActivity.map(stripDoc),
       })
     }
-
     if (path === 'activity' && method === 'GET') {
-      if (!authUser) return err('Unauthorized', 401)
-      const items = await db.collection('activity').find({ userId: authUser.id }).sort({ createdAt: -1 }).limit(100).toArray()
-      return json({ activity: items.map(stripMongoId) })
+      if (!u) return e('Unauthorized', 401)
+      const items = await db.collection('activity').find({ userId: u.id }).sort({ createdAt: -1 }).limit(200).toArray()
+      return j({ activity: items.map(stripDoc) })
     }
 
-    // -------- PUBLIC API (the magic) --------
-    const publicMatch = path.match(/^public\/([a-f0-9]+)$/)
-    if (publicMatch && method === 'GET') {
-      const token = publicMatch[1]
-      const connector = await db.collection('connectors').findOne({ token })
-      if (!connector) return err('Invalid or revoked API token', 401)
-      if (connector.status !== 'active') return err('Connector inactive', 403)
+    // ── PUBLIC API (with query params, caching, masking, governance) ──
+    const pubMatch = path.match(/^public\/([a-f0-9]+)$/)
+    if (pubMatch && method === 'GET') {
+      const tok = pubMatch[1]
+      const c = await db.collection('connectors').findOne({ token: tok })
+      if (!c) return e('Invalid or revoked API token', 401)
+      if (c.revoked || c.status === 'revoked') return e('Token has been revoked', 401)
+      if (c.expiresAt && new Date(c.expiresAt) < new Date()) return e('Token expired', 401)
 
-      const gviz = await fetchGvizJson(connector.sheetId, connector.gid)
-      const parsed = parseSheet(gviz)
-      const allowed = connector.columns && connector.columns.length > 0 ? connector.columns : null
-      let records = parsed.rows.map(r => rowToObject(parsed.columns, r, allowed))
-      records = applyFilter(records, connector.filter)
+      // Simple per-token rate limit: 120 req/min (in-memory)
+      if (!global._sf_rl) global._sf_rl = new Map()
+      const now = Date.now()
+      const arr = (global._sf_rl.get(tok) || []).filter(t => now - t < 60000)
+      if (arr.length >= 120) return e('Rate limit exceeded (120 req/min)', 429)
+      arr.push(now); global._sf_rl.set(tok, arr)
 
-      // increment counter & last sync
-      await db.collection('connectors').updateOne({ id: connector.id }, {
-        $inc: { callCount: 1 },
-        $set: { lastSyncAt: new Date().toISOString() },
-      })
-      await db.collection('activity').insertOne({
-        id: uuidv4(), userId: connector.userId, action: 'api_call',
-        meta: { connectorId: connector.id, count: records.length },
-        createdAt: new Date().toISOString(),
-      })
+      const src = await db.collection('sources').findOne({ id: c.sourceId })
+      // backwards-compat: if no source (legacy connector with sheetId on itself), treat as google_sheet
+      const effectiveSrc = src || (c.sheetId ? { type: 'google_sheet', sheetId: c.sheetId, gid: c.gid } : null)
+      if (!effectiveSrc) return e('Source not found', 404)
 
-      return json({
-        connector: connector.name,
-        department: connector.department,
-        count: records.length,
-        generated_at: new Date().toISOString(),
-        data: records,
+      const { columns, rows, fromCache } = await getCachedOrLive(db, c, effectiveSrc)
+      const allowed = c.columns?.length ? c.columns : null
+      let records = rows.map(r => rowToObj(columns, r, allowed))
+      records = applyFilter(records, c.filter)
+      records = applyMasking(records, c.maskedColumns)
+      const sp = new URL(request.url).searchParams
+      const { records: out, total } = applyQueryParams(records, sp)
+
+      await db.collection('connectors').updateOne({ id: c.id }, { $inc: { callCount: 1 }, $set: { lastSyncAt: new Date().toISOString() } })
+      await db.collection('activity').insertOne({ id: uuidv4(), userId: c.userId, action: 'api_call',
+        meta: { connectorId: c.id, count: out.length, fromCache, ip: request.headers.get('x-forwarded-for') || null },
+        createdAt: new Date().toISOString() })
+
+      return j({
+        connector: c.name, department: c.department, count: out.length, total, fromCache,
+        generated_at: new Date().toISOString(), data: out,
       })
     }
 
-    return err('Not found: ' + path, 404)
-  } catch (e) {
-    console.error('API error:', e)
-    return err(e.message || 'Internal server error', 500)
+    return e('Not found: ' + path, 404)
+  } catch (err) {
+    console.error('API error:', err)
+    return e(err.message || 'Internal server error', 500)
   }
-}
-
-function stripMongoId(doc) {
-  if (!doc) return doc
-  const { _id, passwordHash, ...rest } = doc
-  return rest
 }
 
 export const GET = handler
