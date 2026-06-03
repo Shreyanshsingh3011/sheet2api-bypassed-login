@@ -10,8 +10,22 @@ const DB_NAME = process.env.DB_NAME || 'sheetflow_ai'
 const JWT_SECRET = process.env.JWT_SECRET || 'sheetflow_dev_secret'
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI // optional - falls back to request origin
 const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || ''
+
+// Derive base + redirect URI from the request (so it works on any deployed domain)
+function getOriginFromRequest(request) {
+  try {
+    const xfHost = request.headers.get('x-forwarded-host')
+    const xfProto = request.headers.get('x-forwarded-proto') || 'https'
+    if (xfHost) return `${xfProto}://${xfHost}`
+    return new URL(request.url).origin
+  } catch { return BASE_URL }
+}
+function getRedirectUri(request) {
+  if (GOOGLE_REDIRECT_URI) return GOOGLE_REDIRECT_URI
+  return `${getOriginFromRequest(request)}/api/auth/google/callback`
+}
 
 // AES-256-GCM encryption for OAuth tokens at rest
 const ENC_KEY = crypto.createHash('sha256').update(JWT_SECRET + '|sf_enc').digest()
@@ -338,10 +352,10 @@ const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/drive.metadata.readonly',
 ].join(' ')
 
-function googleAuthUrl(state, mode = 'login') {
+function googleAuthUrl(state, mode = 'login', redirectUri) {
   const u = new URL('https://accounts.google.com/o/oauth2/v2/auth')
   u.searchParams.set('client_id', GOOGLE_CLIENT_ID)
-  u.searchParams.set('redirect_uri', GOOGLE_REDIRECT_URI)
+  u.searchParams.set('redirect_uri', redirectUri)
   u.searchParams.set('response_type', 'code')
   u.searchParams.set('scope', GOOGLE_SCOPES)
   u.searchParams.set('access_type', 'offline')
@@ -351,13 +365,13 @@ function googleAuthUrl(state, mode = 'login') {
   return u.toString()
 }
 
-async function googleExchangeCode(code) {
+async function googleExchangeCode(code, redirectUri) {
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       code, client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
-      redirect_uri: GOOGLE_REDIRECT_URI, grant_type: 'authorization_code',
+      redirect_uri: redirectUri, grant_type: 'authorization_code',
     }),
   })
   const data = await res.json()
@@ -489,23 +503,33 @@ async function handler(request, { params }) {
 
     // ── Google OAuth ──
     if (path === 'auth/google/start' && method === 'GET') {
-      if (!GOOGLE_CLIENT_ID) return e('Google OAuth not configured', 500)
-      const sp = new URL(request.url).searchParams
-      const linkToken = sp.get('link_token') // JWT of the user wanting to link their google account
-      const state = uuidv4()
-      const stateDoc = { id: state, createdAt: new Date().toISOString() }
-      if (linkToken) {
-        try { const decoded = jwt.verify(linkToken, JWT_SECRET); stateDoc.linkUserId = decoded.id } catch { /* fall through to normal login */ }
+      if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+        console.error('Google OAuth not configured: missing CLIENT_ID or CLIENT_SECRET')
+        const origin = getOriginFromRequest(request)
+        return NextResponse.redirect(`${origin}/?google_error=${encodeURIComponent('Google OAuth not configured on server')}`)
       }
-      await db.collection('oauth_state').insertOne(stateDoc)
-      return NextResponse.redirect(googleAuthUrl(state, stateDoc.linkUserId ? 'link' : 'login'))
+      const redirectUri = getRedirectUri(request)
+      const sp = new URL(request.url).searchParams
+      const linkToken = sp.get('link_token')
+      const state = uuidv4()
+      const stateDoc = { id: state, createdAt: new Date().toISOString(), redirectUri }
+      if (linkToken) {
+        try { const decoded = jwt.verify(linkToken, JWT_SECRET); stateDoc.linkUserId = decoded.id } catch { /* ignore */ }
+      }
+      try { await db.collection('oauth_state').insertOne(stateDoc) } catch (err) {
+        console.error('oauth_state insert failed:', err)
+        const origin = getOriginFromRequest(request)
+        return NextResponse.redirect(`${origin}/?google_error=${encodeURIComponent('Database error - try again')}`)
+      }
+      return NextResponse.redirect(googleAuthUrl(state, stateDoc.linkUserId ? 'link' : 'login', redirectUri))
     }
 
     if (path === 'auth/google/callback' && method === 'GET') {
+      const origin = getOriginFromRequest(request)
       const sp = new URL(request.url).searchParams
       const code = sp.get('code'); const rawState = sp.get('state') || ''
       const errParam = sp.get('error')
-      const redirectFront = (qs) => NextResponse.redirect(`${BASE_URL}/?${qs}`)
+      const redirectFront = (qs) => NextResponse.redirect(`${origin}/?${qs}`)
       if (errParam) return redirectFront(`google_error=${encodeURIComponent(errParam)}`)
       if (!code || !rawState) return redirectFront('google_error=missing_code')
       const [stateId, mode] = rawState.split('::')
@@ -513,11 +537,15 @@ async function handler(request, { params }) {
       if (!st) return redirectFront('google_error=invalid_state')
       await db.collection('oauth_state').deleteOne({ id: stateId })
 
+      // Use SAME redirect URI that was used in /start to satisfy Google
+      const redirectUri = st.redirectUri || getRedirectUri(request)
+
       let tk, info
       try {
-        tk = await googleExchangeCode(code)
+        tk = await googleExchangeCode(code, redirectUri)
         info = await googleUserInfo(tk.access_token)
       } catch (err) {
+        console.error('Google OAuth exchange failed:', err.message)
         return redirectFront(`google_error=${encodeURIComponent(err.message || 'oauth_failed')}`)
       }
       const email = (info.email || '').toLowerCase()
@@ -532,7 +560,6 @@ async function handler(request, { params }) {
       }
       if (tk.refresh_token) tokenFields.googleRefreshToken = encryptStr(tk.refresh_token)
 
-      // Link to existing user if mode=link
       let user
       if (mode === 'link' && st.linkUserId) {
         user = await db.collection('users').findOne({ id: st.linkUserId })
@@ -543,7 +570,6 @@ async function handler(request, { params }) {
         return redirectFront(`google_login=1&token=${jwtTok}&linked=1`)
       }
 
-      // Otherwise login or signup
       user = await db.collection('users').findOne({ email })
       if (!user) {
         user = {
