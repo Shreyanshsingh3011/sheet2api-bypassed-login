@@ -538,6 +538,18 @@ async function handler(request, { params }) {
         out.fromCache = r.fromCache
         const allowed = c.columns?.length ? c.columns : null
         out.sampleMapped = (r.rows || []).slice(0, 1).map(row => rowToObj(r.columns, row, allowed))
+        // Replicate the EXACT public chain to find where rows vanish
+        out.filterVal = c.filter ?? null
+        out.maskedVal = c.maskedColumns ?? null
+        let records = (r.rows || []).map(row => rowToObj(r.columns, row, allowed))
+        out.afterMap = records.length
+        records = applyFilter(records, c.filter)
+        out.afterFilter = records.length
+        records = applyMasking(records, c.maskedColumns)
+        out.afterMask = records.length
+        // second independent live read to test stability
+        const r2 = await getCachedOrLive(db, c, effectiveSrc)
+        out.liveRowCount2 = (r2.rows || []).length
       } catch (err) { out.error = String(err.message) }
       return j(out)
     }
