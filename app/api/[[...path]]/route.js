@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { MongoClient } from 'mongodb'
+import { getSupaDb } from '@/lib/supadb'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { v4 as uuidv4 } from 'uuid'
@@ -50,11 +50,8 @@ function decryptStr(b64) {
 
 let cachedClient = null
 async function getDb() {
-  if (!cachedClient) {
-    cachedClient = new MongoClient(MONGO_URL)
-    await cachedClient.connect()
-  }
-  return cachedClient.db(DB_NAME)
+  // Backed by Supabase (PostgREST) via a MongoDB-compatible adapter.
+  return getSupaDb()
 }
 
 const j = (data, status = 200) => NextResponse.json(data, { status, headers: { 'Access-Control-Allow-Origin': '*' } })
@@ -172,11 +169,19 @@ function applyMasking(records, masked) {
 
 // ───────── Auth ─────────
 const signToken = u => jwt.sign({ id: u.id, email: u.email, name: u.name, role: u.role || 'admin' }, JWT_SECRET, { expiresIn: '30d' })
+
+// LOGIN BYPASS: a fixed shared workspace user. Every request is treated as this
+// user, so all features work without signing in. Data is scoped to this one account.
+const DEMO_USER = { id: 'demo-workspace', email: 'demo@sheet2api.app', name: 'Demo', role: 'admin' }
 function getAuthUser(request) {
+  // If a real Bearer token is present and valid, honor it; otherwise fall back to the
+  // shared demo workspace so the app is fully usable with no login.
   const auth = request.headers.get('authorization') || ''
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null
-  if (!token) return null
-  try { return jwt.verify(token, JWT_SECRET) } catch { return null }
+  if (token) {
+    try { return jwt.verify(token, JWT_SECRET) } catch { /* fall through to demo */ }
+  }
+  return DEMO_USER
 }
 const logAct = async (db, userId, action, meta = {}) => { await db.collection('activity').insertOne({ id: uuidv4(), userId, action, meta, createdAt: new Date().toISOString() }) }
 

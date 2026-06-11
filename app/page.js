@@ -68,32 +68,27 @@ export default function App() {
   const [resetToken, setResetToken] = useState('')
 
   useEffect(() => {
+    // LOGIN BYPASS: no authentication required. Boot straight into the shared
+    // demo workspace. (Google OAuth callback is still honored if it ever happens.)
     const sp = new URLSearchParams(window.location.search)
-    // Google OAuth callback
     if (sp.get('google_login') === '1' && sp.get('token')) {
       localStorage.setItem('sf_token', sp.get('token'))
-      const linked = sp.get('linked') === '1'
       window.history.replaceState({}, '', '/')
-      api('auth/me').then(d => { setUser(d.user); setView('app'); setBooted(true); toast.success(linked ? 'Google account linked!' : `Welcome, ${d.user.name}!`) })
-        .catch(() => { localStorage.removeItem('sf_token'); setBooted(true) })
-      return
     }
     if (sp.get('google_error')) {
-      toast.error('Google sign-in failed: ' + sp.get('google_error'))
       window.history.replaceState({}, '', '/')
     }
-    const rt = sp.get('reset')
-    if (rt) { setResetToken(rt); setView('reset'); setBooted(true); return }
-    const token = localStorage.getItem('sf_token')
-    if (!token) { setBooted(true); return }
-    api('auth/me').then(d => { setUser(d.user); setView('app') })
-      .catch(() => { localStorage.removeItem('sf_token') })
-      .finally(() => setBooted(true))
+    setUser({ id: 'demo-workspace', name: 'Demo', email: 'demo@sheet2api.app', role: 'admin' })
+    setView('app')
+    setAppPage('home')
+    setBooted(true)
   }, [])
 
   const logout = () => {
-    localStorage.removeItem('sf_token'); setUser(null); setView('landing'); setAppPage('home')
-    toast.success('Logged out')
+    // Login is bypassed — "logout" just returns to the workspace home.
+    localStorage.removeItem('sf_token')
+    setUser({ id: 'demo-workspace', name: 'Demo', email: 'demo@sheet2api.app', role: 'admin' })
+    setView('app'); setAppPage('home')
   }
 
   if (!booted) return <div className="min-h-screen flex items-center justify-center bg-background"><Loader2 className="w-6 h-6 animate-spin" /></div>
