@@ -522,6 +522,26 @@ async function handler(request, { params }) {
       return j(out)
     }
 
+    // TEMP DIAGNOSTIC — runs the exact connector read path.
+    const dbgc = path.match(/^debug\/connector\/([a-f0-9]+)$/)
+    if (dbgc && method === 'GET') {
+      const tok = dbgc[1]
+      const c = await db.collection('connectors').findOne({ token: tok })
+      if (!c) return j({ error: 'connector not found' })
+      const src = await db.collection('sources').findOne({ id: c.sourceId })
+      const effectiveSrc = src || (c.sheetId ? { type: 'google_sheet', sheetId: c.sheetId, gid: c.gid } : null)
+      const out = { srcFound: !!src, effType: effectiveSrc?.type, effSheetId: effectiveSrc?.sheetId, effGid: effectiveSrc?.gid, cacheMode: c.cacheMode, connectorColumns: c.columns }
+      try {
+        const r = await getCachedOrLive(db, c, effectiveSrc)
+        out.liveColumns = (r.columns || []).map(x => x.name)
+        out.liveRowCount = (r.rows || []).length
+        out.fromCache = r.fromCache
+        const allowed = c.columns?.length ? c.columns : null
+        out.sampleMapped = (r.rows || []).slice(0, 1).map(row => rowToObj(r.columns, row, allowed))
+      } catch (err) { out.error = String(err.message) }
+      return j(out)
+    }
+
     // ── AUTH ──
     if (path === 'auth/signup' && method === 'POST') {
       const { email, password, name } = await request.json()
