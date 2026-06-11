@@ -503,6 +503,25 @@ async function handler(request, { params }) {
   try {
     if (path === '' || path === 'health') return j({ status: 'ok', service: 'Sheet2API AI', time: new Date().toISOString() })
 
+    // TEMP DIAGNOSTIC — remove after debugging. Reports what Google returns for a sheet.
+    const dbgm = path.match(/^debug\/sheet\/([a-zA-Z0-9-_]+)$/)
+    if (dbgm && method === 'GET') {
+      const sheetId = dbgm[1]
+      const out = { sheetId }
+      try { const p = parseGviz(await fetchGvizJson(sheetId)); out.defaultSheet = { cols: p.columns.map(c => c.name), rows: p.rows.length } }
+      catch (err) { out.defaultSheet = { error: String(err.message) } }
+      try { const r = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`, { cache: 'no-store', redirect: 'follow' }); const t = await r.text(); out.htmlview = { status: r.status, length: t.length } }
+      catch (err) { out.htmlview = { error: String(err.message) } }
+      const gids = await listSheetGids(sheetId)
+      out.gidsFound = gids
+      out.tabs = []
+      for (const gid of gids.slice(0, 25)) {
+        try { const p = parseGviz(await fetchGvizJson(sheetId, gid)); out.tabs.push({ gid, rows: p.rows.length, sampleCols: p.columns.map(c => c.name).slice(0, 4) }) }
+        catch (err) { out.tabs.push({ gid, error: String(err.message) }) }
+      }
+      return j(out)
+    }
+
     // ── AUTH ──
     if (path === 'auth/signup' && method === 'POST') {
       const { email, password, name } = await request.json()
