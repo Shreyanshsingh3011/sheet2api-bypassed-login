@@ -70,7 +70,8 @@ function extractSheetId(url) { const m = String(url||'').match(/\/spreadsheets\/
 function extractGid(url) { const m = String(url||'').match(/[?&#]gid=([0-9]+)/); return m ? m[1] : '0' }
 
 async function fetchGvizJson(sheetId, gid) {
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json&gid=${gid}`
+  const gidPart = (gid !== undefined && gid !== null && gid !== '') ? `&gid=${gid}` : ''
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${gidPart}`
   const res = await fetch(url, { cache: 'no-store', redirect: 'follow' })
   if (!res.ok) throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure share = "Anyone with link, Viewer".`)
   const text = await res.text()
@@ -79,6 +80,43 @@ async function fetchGvizJson(sheetId, gid) {
   const p = JSON.parse(text.substring(a, b + 1))
   if (p.status === 'error') throw new Error('Sheet error: ' + (p.errors?.[0]?.detailed_message || 'unknown').replace(/<[^>]+>/g, ''))
   return p
+}
+
+// Discover every tab (gid) of a PUBLIC spreadsheet without OAuth, by scraping the
+// htmlview page. Best-effort: returns [] on any failure.
+async function listSheetGids(sheetId) {
+  try {
+    const res = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`, { cache: 'no-store', redirect: 'follow' })
+    if (!res.ok) return []
+    const html = await res.text()
+    const gids = []
+    const re = /[#?&]gid=(\d+)/g
+    let m
+    while ((m = re.exec(html)) !== null) { if (!gids.includes(m[1])) gids.push(m[1]) }
+    return gids
+  } catch { return [] }
+}
+
+// Robustly read a Google Sheet: always returns the tab that actually holds the data.
+// 1) try the configured gid; 2) fall back to the default (first) sheet;
+// 3) scan all tabs and pick the one with the most data rows.
+async function fetchSheetSmart(sheetId, preferredGid) {
+  // Fast path: the configured tab has rows.
+  if (preferredGid !== undefined && preferredGid !== null && preferredGid !== '') {
+    try { const p = parseGviz(await fetchGvizJson(sheetId, preferredGid)); if (p.rows.length) return p } catch {}
+  }
+  const collected = []
+  // Default (first) sheet — handles the very common case where the data tab's gid changed.
+  try { const p = parseGviz(await fetchGvizJson(sheetId)); if (p.rows.length) collected.push(p) } catch {}
+  // Every other tab.
+  const gids = await listSheetGids(sheetId)
+  for (const gid of gids) {
+    if (String(gid) === String(preferredGid)) continue
+    try { const p = parseGviz(await fetchGvizJson(sheetId, gid)); if (p.rows.length) collected.push(p) } catch {}
+  }
+  if (collected.length) return collected.sort((a, b) => b.rows.length - a.rows.length)[0]
+  // Last resort: return the configured tab even if empty (keeps column metadata).
+  try { return parseGviz(await fetchGvizJson(sheetId, preferredGid)) } catch { return { columns: [], rows: [], rowCount: 0 } }
 }
 
 function parseGviz(g) {
@@ -333,8 +371,8 @@ async function getCachedOrLive(db, connector, source) {
   }
   let columns, rows
   if (source.type === 'google_sheet') {
-    const g = await fetchGvizJson(source.sheetId, source.gid || '0')
-    const p = parseGviz(g); columns = p.columns; rows = p.rows
+    const p = await fetchSheetSmart(source.sheetId, source.gid)
+    columns = p.columns; rows = p.rows
   } else if (source.type === 'google_sheet_private') {
     const at = await getValidGoogleAccessToken(db, source.userId)
     const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle)
@@ -635,7 +673,7 @@ async function handler(request, { params }) {
       const { url } = await request.json()
       const sheetId = extractSheetId(url); if (!sheetId) return e('Invalid Google Sheets URL.')
       const gid = extractGid(url)
-      const g = await fetchGvizJson(sheetId, gid); const p = parseGviz(g)
+      const p = await fetchSheetSmart(sheetId, gid); p.rowCount = p.rows.length
       return j({ sheetId, gid, columns: p.columns, rowCount: p.rowCount, preview: p.rows.slice(0, 5).map(r => rowToObj(p.columns, r)) })
     }
 
@@ -654,8 +692,8 @@ async function handler(request, { params }) {
       if (b.type === 'google_sheet') {
         const sheetId = extractSheetId(b.url); if (!sheetId) return e('Invalid Google Sheets URL')
         const gid = extractGid(b.url)
-        // verify
-        const g = await fetchGvizJson(sheetId, gid); const p = parseGviz(g)
+        // verify + capture the tab that actually has data
+        const p = await fetchSheetSmart(sheetId, gid); p.rowCount = p.rows.length
         src = { ...src, url: b.url, sheetId, gid, columnsMeta: p.columns, rowCount: p.rowCount }
       } else if (b.type === 'google_sheet_private') {
         if (!b.spreadsheetId || !b.sheetTitle) return e('Missing spreadsheetId or sheetTitle')
@@ -684,7 +722,7 @@ async function handler(request, { params }) {
         // return preview from columnsMeta + first 5 rows
         let preview = []
         if (src.type === 'google_sheet') {
-          try { const g = await fetchGvizJson(src.sheetId, src.gid); const p = parseGviz(g); preview = p.rows.slice(0,5).map(r => rowToObj(p.columns, r)) } catch {}
+          try { const p = await fetchSheetSmart(src.sheetId, src.gid); preview = p.rows.slice(0,5).map(r => rowToObj(p.columns, r)) } catch {}
         } else if (src.type === 'google_sheet_private') {
           try {
             const at = await getValidGoogleAccessToken(db, u.id)
