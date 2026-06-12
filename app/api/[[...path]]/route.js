@@ -989,6 +989,7 @@ async function handler(request, { params }) {
       return j({
         connector: c.name, department: c.department, count: out.length, total, fromCache,
         _liveRows: rows.length, _afterMask: _afterMask, _connId: c.id,
+        _spSearch: new URL(request.url).search, _spKeys: [...new URL(request.url).searchParams.keys()],
         generated_at: new Date().toISOString(), data: out,
       })
     }
