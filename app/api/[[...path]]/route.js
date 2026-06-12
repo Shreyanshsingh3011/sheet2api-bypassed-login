@@ -988,6 +988,7 @@ async function handler(request, { params }) {
 
       return j({
         connector: c.name, department: c.department, count: out.length, total, fromCache,
+        _liveRows: rows.length, _afterMask: _afterMask, _connId: c.id,
         generated_at: new Date().toISOString(), data: out,
       })
     }
