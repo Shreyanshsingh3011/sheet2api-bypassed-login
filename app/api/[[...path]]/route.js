@@ -71,7 +71,7 @@ function extractGid(url) { const m = String(url||'').match(/[?&#]gid=([0-9]+)/);
 
 async function fetchGvizJson(sheetId, gid) {
   const gidPart = (gid !== undefined && gid !== null && gid !== '') ? `&gid=${gid}` : ''
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${gidPart}`
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${gidPart}&_cb=${Date.now()}`
   const res = await fetch(url, { cache: 'no-store', redirect: 'follow' })
   if (!res.ok) throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure share = "Anyone with link, Viewer".`)
   const text = await res.text()
@@ -966,3 +966,8 @@ export const POST = handler
 export const PUT = handler
 export const DELETE = handler
 export const PATCH = handler
+
+// Force this route to be fully dynamic and never cache any fetch (e.g. Google Sheets reads).
+export const dynamic = 'force-dynamic'
+export const fetchCache = 'force-no-store'
+export const revalidate = 0
