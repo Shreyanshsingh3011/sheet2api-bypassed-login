@@ -936,6 +936,11 @@ async function handler(request, { params }) {
       if (!effectiveSrc) return e('Source not found', 404)
 
       const { columns, rows, fromCache } = await getCachedOrLive(db, c, effectiveSrc)
+      if (new URL(request.url).searchParams.get('__diag') === '1') {
+        return j({ __diag: true, rowsFromLive: rows.length, cols: (columns || []).map(x => x.name),
+          srcType: effectiveSrc.type, srcSheetId: effectiveSrc.sheetId, srcGid: effectiveSrc.gid,
+          srcFound: !!src, cacheMode: c.cacheMode, connSheetId: c.sheetId, connGid: c.gid })
+      }
       const allowed = c.columns?.length ? c.columns : null
       let records = rows.map(r => rowToObj(columns, r, allowed))
       records = applyFilter(records, c.filter)
