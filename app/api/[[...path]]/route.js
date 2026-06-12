@@ -69,14 +69,24 @@ export async function OPTIONS() {
 function extractSheetId(url) { const m = String(url||'').match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/); return m ? m[1] : null }
 function extractGid(url) { const m = String(url||'').match(/[?&#]gid=([0-9]+)/); return m ? m[1] : '0' }
 
-async function fetchGvizJson(sheetId, gid) {
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+async function fetchGvizJson(sheetId, gid, attempt = 0) {
   const gidPart = (gid !== undefined && gid !== null && gid !== '') ? `&gid=${gid}` : ''
-  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${gidPart}&_cb=${Date.now()}`
-  const res = await fetch(url, { cache: 'no-store', redirect: 'follow' })
-  if (!res.ok) throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure share = "Anyone with link, Viewer".`)
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json${gidPart}&_cb=${Date.now()}_${Math.random().toString(36).slice(2)}`
+  let res
+  try { res = await fetch(url, { cache: 'no-store', redirect: 'follow' }) }
+  catch (err) { if (attempt < 3) { await sleep(250 * (attempt + 1)); return fetchGvizJson(sheetId, gid, attempt + 1) } throw err }
+  if (!res.ok) {
+    if ((res.status === 429 || res.status >= 500) && attempt < 3) { await sleep(300 * (attempt + 1)); return fetchGvizJson(sheetId, gid, attempt + 1) }
+    throw new Error(`Cannot read sheet (HTTP ${res.status}). Ensure share = "Anyone with link, Viewer".`)
+  }
   const text = await res.text()
   const a = text.indexOf('{'), b = text.lastIndexOf('}')
-  if (a === -1 || b === -1) throw new Error('Invalid response from Google. Make sure the sheet link is public.')
+  if (a === -1 || b === -1) {
+    if (attempt < 3) { await sleep(300 * (attempt + 1)); return fetchGvizJson(sheetId, gid, attempt + 1) }
+    throw new Error('Invalid response from Google. Make sure the sheet link is public.')
+  }
   const p = JSON.parse(text.substring(a, b + 1))
   if (p.status === 'error') throw new Error('Sheet error: ' + (p.errors?.[0]?.detailed_message || 'unknown').replace(/<[^>]+>/g, ''))
   return p
@@ -100,7 +110,8 @@ async function listSheetGids(sheetId) {
 // Robustly read a Google Sheet: always returns the tab that actually holds the data.
 // 1) try the configured gid; 2) fall back to the default (first) sheet;
 // 3) scan all tabs and pick the one with the most data rows.
-async function fetchSheetSmart(sheetId, preferredGid) {
+// Retries the whole flow a few times if it comes back empty (Google gviz is flaky).
+async function fetchSheetSmart(sheetId, preferredGid, attempt = 0) {
   // Fast path: the configured tab has rows.
   if (preferredGid !== undefined && preferredGid !== null && preferredGid !== '') {
     try { const p = parseGviz(await fetchGvizJson(sheetId, preferredGid)); if (p.rows.length) return p } catch {}
@@ -115,6 +126,8 @@ async function fetchSheetSmart(sheetId, preferredGid) {
     try { const p = parseGviz(await fetchGvizJson(sheetId, gid)); if (p.rows.length) collected.push(p) } catch {}
   }
   if (collected.length) return collected.sort((a, b) => b.rows.length - a.rows.length)[0]
+  // Nothing yet — retry the whole flow (gviz frequently returns transient empties).
+  if (attempt < 3) { await sleep(400 * (attempt + 1)); return fetchSheetSmart(sheetId, preferredGid, attempt + 1) }
   // Last resort: return the configured tab even if empty (keeps column metadata).
   try { return parseGviz(await fetchGvizJson(sheetId, preferredGid)) } catch { return { columns: [], rows: [], rowCount: 0 } }
 }
@@ -362,26 +375,41 @@ function gen_openApi(c, baseUrl) {
 
 // ───────── Cache ─────────
 async function getCachedOrLive(db, connector, source) {
+  const cacheKey = connector.id
+  // cached mode: serve a fresh, non-empty cache within TTL
   if (connector.cacheMode === 'cached') {
     const ttl = (connector.cacheTTLSeconds || 300) * 1000
-    const cached = await db.collection('cache').findOne({ tokenId: connector.id })
-    if (cached && (Date.now() - new Date(cached.generatedAt).getTime()) < ttl) {
+    const cached = await db.collection('cache').findOne({ tokenId: cacheKey })
+    if (cached && cached.rows?.length && (Date.now() - new Date(cached.generatedAt).getTime()) < ttl) {
       return { columns: cached.columns, rows: cached.rows, fromCache: true }
     }
   }
-  let columns, rows
-  if (source.type === 'google_sheet') {
-    const p = await fetchSheetSmart(source.sheetId, source.gid)
-    columns = p.columns; rows = p.rows
-  } else if (source.type === 'google_sheet_private') {
-    const at = await getValidGoogleAccessToken(db, source.userId)
-    const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle)
-    columns = sd.columns; rows = sd.rows
-  } else {
-    columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
+  let columns = [], rows = []
+  try {
+    if (source.type === 'google_sheet') {
+      const p = await fetchSheetSmart(source.sheetId, source.gid)
+      columns = p.columns; rows = p.rows
+    } else if (source.type === 'google_sheet_private') {
+      const at = await getValidGoogleAccessToken(db, source.userId)
+      const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle)
+      columns = sd.columns; rows = sd.rows
+    } else {
+      columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
+    }
+  } catch { /* fall through to last-known-good below */ }
+
+  if (rows.length > 0) {
+    // Persist this good read as the last-known-good snapshot (resilience for all modes).
+    await db.collection('cache').updateOne({ tokenId: cacheKey },
+      { $set: { tokenId: cacheKey, columns, rows, generatedAt: new Date().toISOString() } }, { upsert: true }).catch(() => {})
+    return { columns, rows, fromCache: false }
   }
-  if (connector.cacheMode === 'cached') {
-    await db.collection('cache').updateOne({ tokenId: connector.id }, { $set: { tokenId: connector.id, columns, rows, generatedAt: new Date().toISOString() } }, { upsert: true })
+
+  // Live read came back empty (Google flaked or sheet temporarily unreadable):
+  // serve the last-known-good snapshot instead of returning nothing.
+  const fallback = await db.collection('cache').findOne({ tokenId: cacheKey })
+  if (fallback && fallback.rows?.length) {
+    return { columns: fallback.columns, rows: fallback.rows, fromCache: true }
   }
   return { columns, rows, fromCache: false }
 }
