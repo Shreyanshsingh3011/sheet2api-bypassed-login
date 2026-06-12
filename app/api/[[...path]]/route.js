@@ -167,12 +167,17 @@ function applyFilter(records, filter) {
 }
 
 function applyQueryParams(records, sp) {
+  const RESERVED = new Set(['q', 'sort', 'page', 'limit', 'offset', 'fields', 'format', 'callback'])
+  // Only real data columns may be used as ?col=value filters. Unknown params
+  // (framework/proxy-injected like _vercel_share, cache-busters, etc.) are ignored.
+  const known = new Set(records.length ? Object.keys(records[0]) : [])
   // Search (q): substring match across all fields
   const q = sp.get('q')
   if (q) { const s = q.toLowerCase(); records = records.filter(r => Object.values(r).some(v => String(v ?? '').toLowerCase().includes(s))) }
-  // ?field=value style filtering
+  // ?field=value style filtering (only for actual columns)
   for (const [k, v] of sp.entries()) {
-    if (['q','sort','page','limit','offset','fields','format'].includes(k)) continue
+    if (RESERVED.has(k) || k.startsWith('_')) continue
+    if (!known.has(k)) continue
     records = records.filter(r => String(r[k] ?? '').toLowerCase() === String(v).toLowerCase())
   }
   // Sort
@@ -531,56 +536,6 @@ async function handler(request, { params }) {
   try {
     if (path === '' || path === 'health') return j({ status: 'ok', service: 'Sheet2API AI', time: new Date().toISOString() })
 
-    // TEMP DIAGNOSTIC — remove after debugging. Reports what Google returns for a sheet.
-    const dbgm = path.match(/^debug\/sheet\/([a-zA-Z0-9-_]+)$/)
-    if (dbgm && method === 'GET') {
-      const sheetId = dbgm[1]
-      const out = { sheetId }
-      try { const p = parseGviz(await fetchGvizJson(sheetId)); out.defaultSheet = { cols: p.columns.map(c => c.name), rows: p.rows.length } }
-      catch (err) { out.defaultSheet = { error: String(err.message) } }
-      try { const r = await fetch(`https://docs.google.com/spreadsheets/d/${sheetId}/htmlview`, { cache: 'no-store', redirect: 'follow' }); const t = await r.text(); out.htmlview = { status: r.status, length: t.length } }
-      catch (err) { out.htmlview = { error: String(err.message) } }
-      const gids = await listSheetGids(sheetId)
-      out.gidsFound = gids
-      out.tabs = []
-      for (const gid of gids.slice(0, 25)) {
-        try { const p = parseGviz(await fetchGvizJson(sheetId, gid)); out.tabs.push({ gid, rows: p.rows.length, sampleCols: p.columns.map(c => c.name).slice(0, 4) }) }
-        catch (err) { out.tabs.push({ gid, error: String(err.message) }) }
-      }
-      return j(out)
-    }
-
-    // TEMP DIAGNOSTIC — runs the exact connector read path.
-    const dbgc = path.match(/^debug\/connector\/([a-f0-9]+)$/)
-    if (dbgc && method === 'GET') {
-      const tok = dbgc[1]
-      const c = await db.collection('connectors').findOne({ token: tok })
-      if (!c) return j({ error: 'connector not found' })
-      const src = await db.collection('sources').findOne({ id: c.sourceId })
-      const effectiveSrc = src || (c.sheetId ? { type: 'google_sheet', sheetId: c.sheetId, gid: c.gid } : null)
-      const out = { srcFound: !!src, effType: effectiveSrc?.type, effSheetId: effectiveSrc?.sheetId, effGid: effectiveSrc?.gid, cacheMode: c.cacheMode, connectorColumns: c.columns }
-      try {
-        const r = await getCachedOrLive(db, c, effectiveSrc)
-        out.liveColumns = (r.columns || []).map(x => x.name)
-        out.liveRowCount = (r.rows || []).length
-        out.fromCache = r.fromCache
-        const allowed = c.columns?.length ? c.columns : null
-        out.sampleMapped = (r.rows || []).slice(0, 1).map(row => rowToObj(r.columns, row, allowed))
-        // Replicate the EXACT public chain to find where rows vanish
-        out.filterVal = c.filter ?? null
-        out.maskedVal = c.maskedColumns ?? null
-        let records = (r.rows || []).map(row => rowToObj(r.columns, row, allowed))
-        out.afterMap = records.length
-        records = applyFilter(records, c.filter)
-        out.afterFilter = records.length
-        records = applyMasking(records, c.maskedColumns)
-        out.afterMask = records.length
-        // second independent live read to test stability
-        const r2 = await getCachedOrLive(db, c, effectiveSrc)
-        out.liveRowCount2 = (r2.rows || []).length
-      } catch (err) { out.error = String(err.message) }
-      return j(out)
-    }
 
     // ── AUTH ──
     if (path === 'auth/signup' && method === 'POST') {
@@ -966,18 +921,8 @@ async function handler(request, { params }) {
       const { columns, rows, fromCache } = await getCachedOrLive(db, c, effectiveSrc)
       const allowed = c.columns?.length ? c.columns : null
       let records = rows.map(r => rowToObj(columns, r, allowed))
-      const _afterMap = records.length
       records = applyFilter(records, c.filter)
-      const _afterFilter = records.length
       records = applyMasking(records, c.maskedColumns)
-      const _afterMask = records.length
-      if (new URL(request.url).searchParams.get('__diag') === '1') {
-        const testSp = new URLSearchParams('limit=2')
-        const qp = applyQueryParams(records, testSp)
-        return j({ __diag: true, rowsFromLive: rows.length, afterMap: _afterMap, afterFilter: _afterFilter, afterMask: _afterMask,
-          qpTotal: qp.total, qpCount: qp.records.length,
-          allowed, filter: c.filter ?? null, masked: c.maskedColumns ?? null })
-      }
       const sp = new URL(request.url).searchParams
       const { records: out, total } = applyQueryParams(records, sp)
 
@@ -988,8 +933,6 @@ async function handler(request, { params }) {
 
       return j({
         connector: c.name, department: c.department, count: out.length, total, fromCache,
-        _liveRows: rows.length, _afterMask: _afterMask, _connId: c.id,
-        _spSearch: new URL(request.url).search, _spKeys: [...new URL(request.url).searchParams.keys()],
         generated_at: new Date().toISOString(), data: out,
       })
     }
