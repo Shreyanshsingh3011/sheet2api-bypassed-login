@@ -944,9 +944,11 @@ async function handler(request, { params }) {
       records = applyMasking(records, c.maskedColumns)
       const _afterMask = records.length
       if (new URL(request.url).searchParams.get('__diag') === '1') {
+        const testSp = new URLSearchParams('limit=2')
+        const qp = applyQueryParams(records, testSp)
         return j({ __diag: true, rowsFromLive: rows.length, afterMap: _afterMap, afterFilter: _afterFilter, afterMask: _afterMask,
-          allowed, filter: c.filter ?? null, masked: c.maskedColumns ?? null,
-          liveCols: (columns || []).map(x => x.name), connColumns: c.columns })
+          qpTotal: qp.total, qpCount: qp.records.length,
+          allowed, filter: c.filter ?? null, masked: c.maskedColumns ?? null })
       }
       const sp = new URL(request.url).searchParams
       const { records: out, total } = applyQueryParams(records, sp)
