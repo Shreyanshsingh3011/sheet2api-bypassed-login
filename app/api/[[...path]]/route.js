@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getSupaDb } from '@/lib/supadb'
+import { getSupaDb, getHeaderMapping } from '@/lib/supadb'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { v4 as uuidv4 } from 'uuid'
@@ -227,6 +227,45 @@ const rowToObj = (cols, row, allowed) => {
     o[c.name] = v ?? null
   })
   return o
+}
+
+// Apply a per-token dbridge_header_mappings override to a derived column list.
+// Renames columns (by position when by_index, else by current header name),
+// honoring keep_only_mapped / drop_empty_named. Each column keeps its original
+// index/letter so value lookup stays correct after renaming. Never throws.
+function applyHeaderMapping(columns, mapping) {
+  if (!mapping) return columns
+  let ov = mapping.column_overrides
+  if (typeof ov === 'string') { try { ov = JSON.parse(ov) } catch { ov = null } }
+  if (!ov || typeof ov !== 'object') ov = {}
+  const byIndex = mapping.by_index === true
+
+  let cols = columns.map(c => {
+    let name = c.name
+    let mapped = false
+    if (byIndex) {
+      const v = ov[String(c.index)]
+      if (v != null && String(v).trim() !== '') { name = String(v).trim(); mapped = true }
+    } else {
+      const hit = Object.keys(ov).find(k => k.toLowerCase() === String(c.name).toLowerCase())
+      if (hit && String(ov[hit]).trim() !== '') { name = String(ov[hit]).trim(); mapped = true }
+    }
+    return { ...c, name, mapped }
+  })
+
+  if (mapping.keep_only_mapped === true) cols = cols.filter(c => c.mapped)
+  // drop_empty_named: drop columns that were never given a real header (named only
+  // by their column letter) and weren't mapped.
+  if (mapping.drop_empty_named === true) cols = cols.filter(c => c.mapped || (c.name && c.name !== c.letter))
+
+  // Renames can collide; de-dupe the final keys (name, name (2), …).
+  const seen = new Map()
+  return cols.map(({ mapped, ...c }) => {
+    let key = c.name
+    if (seen.has(key)) { const n = seen.get(key) + 1; seen.set(key, n); key = `${key} (${n})` }
+    else seen.set(key, 1)
+    return { ...c, name: key }
+  })
 }
 
 // ───────── Query helpers ─────────
@@ -460,8 +499,10 @@ function gen_openApi(c, baseUrl) {
 }
 
 // ───────── Cache ─────────
-async function getCachedOrLive(db, connector, source) {
+async function getCachedOrLive(db, connector, source, headerRowOverride) {
   const cacheKey = connector.id
+  // A non-null dbridge_header_mappings.header_row_index wins over the connector's own setting.
+  const headerRow = headerRowOverride != null ? headerRowOverride : connector.headerRow
   // cached mode: serve a fresh, non-empty cache within TTL
   if (connector.cacheMode === 'cached') {
     const ttl = (connector.cacheTTLSeconds || 300) * 1000
@@ -473,11 +514,11 @@ async function getCachedOrLive(db, connector, source) {
   let columns = [], rows = []
   try {
     if (source.type === 'google_sheet') {
-      const p = await fetchSheetSmart(source.sheetId, source.gid, connector.headerRow)
+      const p = await fetchSheetSmart(source.sheetId, source.gid, headerRow)
       columns = p.columns; rows = p.rows
     } else if (source.type === 'google_sheet_private') {
       const at = await getValidGoogleAccessToken(db, source.userId)
-      const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle, connector.headerRow)
+      const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle, headerRow)
       columns = sd.columns; rows = sd.rows
     } else {
       columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
@@ -993,7 +1034,13 @@ async function handler(request, { params }) {
       const effectiveSrc = src || (c.sheetId ? { type: 'google_sheet', sheetId: c.sheetId, gid: c.gid } : null)
       if (!effectiveSrc) return e('Source not found', 404)
 
-      const { columns, rows, fromCache } = await getCachedOrLive(db, c, effectiveSrc)
+      // Per-token header override (dbridge_header_mappings). Best-effort: null if
+      // absent or unreadable, so the public API degrades to plain header detection.
+      const hmap = await getHeaderMapping(tok).catch(() => null)
+      const headerRowOverride = hmap && hmap.header_row_index != null ? Number(hmap.header_row_index) + 1 : undefined
+
+      const { columns: rawColumns, rows, fromCache } = await getCachedOrLive(db, c, effectiveSrc, headerRowOverride)
+      const columns = applyHeaderMapping(rawColumns, hmap)
       const allowed = c.columns?.length ? c.columns : null
       let records = rows.map(r => rowToObj(columns, r, allowed))
       records = applyFilter(records, c.filter)
