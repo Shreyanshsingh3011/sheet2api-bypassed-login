@@ -141,13 +141,20 @@ function deriveColumnsAndRows(grid, headerRowSetting) {
 
   const headerRow = all[headerIdx] || []
   const dataRows = all.slice(headerIdx + 1)
+  // Span every column present in the header OR any data row, so a column is never
+  // dropped just because its header cell happens to be blank.
   const width = Math.max(headerRow.length, ...dataRows.map(r => (Array.isArray(r) ? r.length : 0)), 0)
 
+  // Build the ordered column list ONCE. Each entry keeps its ORIGINAL spreadsheet
+  // position (index + column letter) for value lookup, SEPARATE from the chosen
+  // output key. The key is the header text if it is a non-empty string, otherwise
+  // the column letter. Repeated header labels are de-duped: name, name (2), …
   const seen = new Map()
   const columns = []
   for (let i = 0; i < width; i++) {
+    const letter = colLetter(i)
     const h = headerRow[i]
-    let key = (typeof h === 'string' && h.trim() !== '') ? h.trim() : colLetter(i)
+    let key = (typeof h === 'string' && h.trim() !== '') ? h.trim() : letter
     if (seen.has(key)) {
       const n = seen.get(key) + 1
       seen.set(key, n)
@@ -155,10 +162,13 @@ function deriveColumnsAndRows(grid, headerRowSetting) {
     } else {
       seen.set(key, 1)
     }
-    columns.push({ id: `col${i}`, name: key, type: 'string' })
+    columns.push({ id: `col${i}`, index: i, letter, name: key, type: 'string' })
   }
 
-  const rows = dataRows.map(r => columns.map((_, i) => (Array.isArray(r) ? (r[i] ?? null) : null)))
+  // ALWAYS read each cell by its ORIGINAL column position (index == letter), then
+  // place it under the chosen output key. Never look the source cell up by the
+  // renamed key — that is what dropped text-header columns before.
+  const rows = dataRows.map(r => columns.map(c => (Array.isArray(r) ? (r[c.index] ?? null) : null)))
   return { columns, rows, rowCount: rows.length }
 }
 
@@ -201,7 +211,17 @@ async function fetchSheetSmart(sheetId, preferredGid, headerRow, attempt = 0) {
 }
 
 const rowToObj = (cols, row, allowed) => {
-  const o = {}; cols.forEach((c, i) => { if (!allowed || !allowed.length || allowed.includes(c.name)) o[c.name] = row[i] ?? null }); return o
+  const o = {}
+  const isArr = Array.isArray(row)
+  cols.forEach((c, i) => {
+    if (allowed && allowed.length && !allowed.includes(c.name)) return
+    // Read the value by ORIGINAL position. For array rows that is the index; for
+    // object rows (e.g. legacy/cached shapes keyed by column letter) fall back to
+    // the letter/id. Output is always stored under the chosen key (c.name).
+    const v = isArr ? row[c.index ?? i] : (row ? (row[c.letter] ?? row[c.id] ?? row[c.name]) : undefined)
+    o[c.name] = v ?? null
+  })
+  return o
 }
 
 // ───────── Query helpers ─────────
