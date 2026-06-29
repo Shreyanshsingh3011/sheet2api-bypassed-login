@@ -107,41 +107,97 @@ async function listSheetGids(sheetId) {
   } catch { return [] }
 }
 
+// ───────── Header derivation (stable keys) ─────────
+// Spreadsheet column letter for a 0-based index: 0→A, 25→Z, 26→AA, …
+function colLetter(i){let s="";i++;while(i>0){i--;s=String.fromCharCode(65+(i%26))+s;i=Math.floor(i/26);}return s;}
+
+// Is this cell value a number (or a numeric string)? Used to skip totals rows.
+function isNumericCell(v) {
+  if (typeof v === 'number') return Number.isFinite(v)
+  if (typeof v === 'string') { const t = v.trim(); return t !== '' && Number.isFinite(Number(t)) }
+  return false
+}
+
+// Turn a raw 2D grid (all sheet rows, top-to-bottom) into { columns, rows }.
+// - headerRowSetting (1-based int, optional): force which row is the header; rows above it are dropped.
+// - Otherwise auto-detect: first row whose column A is a non-empty, non-numeric string.
+// Keys come ONLY from the header row text (trimmed) or the column letter — never from a data value.
+// Repeated header labels are de-duplicated as "name", "name (2)", "name (3)", …
+function deriveColumnsAndRows(grid, headerRowSetting) {
+  const all = Array.isArray(grid) ? grid : []
+  if (all.length === 0) return { columns: [], rows: [], rowCount: 0 }
+
+  let headerIdx
+  const hr = Number(headerRowSetting)
+  if (Number.isInteger(hr) && hr >= 1) {
+    headerIdx = Math.min(hr - 1, all.length - 1)
+  } else {
+    headerIdx = all.findIndex(row => {
+      const a = Array.isArray(row) ? row[0] : undefined
+      return typeof a === 'string' && a.trim() !== '' && !isNumericCell(a)
+    })
+    if (headerIdx === -1) headerIdx = 0
+  }
+
+  const headerRow = all[headerIdx] || []
+  const dataRows = all.slice(headerIdx + 1)
+  const width = Math.max(headerRow.length, ...dataRows.map(r => (Array.isArray(r) ? r.length : 0)), 0)
+
+  const seen = new Map()
+  const columns = []
+  for (let i = 0; i < width; i++) {
+    const h = headerRow[i]
+    let key = (typeof h === 'string' && h.trim() !== '') ? h.trim() : colLetter(i)
+    if (seen.has(key)) {
+      const n = seen.get(key) + 1
+      seen.set(key, n)
+      key = `${key} (${n})`
+    } else {
+      seen.set(key, 1)
+    }
+    columns.push({ id: `col${i}`, name: key, type: 'string' })
+  }
+
+  const rows = dataRows.map(r => columns.map((_, i) => (Array.isArray(r) ? (r[i] ?? null) : null)))
+  return { columns, rows, rowCount: rows.length }
+}
+
+// Reconstruct the full raw grid from a gviz table. gviz often lifts the sheet's
+// first row into the column labels; restore it as the top grid row so header
+// detection sees every original row.
+function gvizToGrid(g) {
+  const t = g.table || {}
+  const cols = t.cols || []
+  const grid = (t.rows || []).map(r => (r.c || []).map(c => (c ? (c.v ?? null) : null)))
+  const labels = cols.map(c => (c && typeof c.label === 'string' && c.label.trim() !== '') ? c.label : null)
+  if (labels.some(l => l !== null)) grid.unshift(labels)
+  return grid
+}
+
 // Robustly read a Google Sheet: always returns the tab that actually holds the data.
 // 1) try the configured gid; 2) fall back to the default (first) sheet;
 // 3) scan all tabs and pick the one with the most data rows.
 // Retries the whole flow a few times if it comes back empty (Google gviz is flaky).
-async function fetchSheetSmart(sheetId, preferredGid, attempt = 0) {
+async function fetchSheetSmart(sheetId, preferredGid, headerRow, attempt = 0) {
+  const parse = g => deriveColumnsAndRows(gvizToGrid(g), headerRow)
   // Fast path: the configured tab has rows.
   if (preferredGid !== undefined && preferredGid !== null && preferredGid !== '') {
-    try { const p = parseGviz(await fetchGvizJson(sheetId, preferredGid)); if (p.rows.length) return p } catch {}
+    try { const p = parse(await fetchGvizJson(sheetId, preferredGid)); if (p.rows.length) return p } catch {}
   }
   const collected = []
   // Default (first) sheet — handles the very common case where the data tab's gid changed.
-  try { const p = parseGviz(await fetchGvizJson(sheetId)); if (p.rows.length) collected.push(p) } catch {}
+  try { const p = parse(await fetchGvizJson(sheetId)); if (p.rows.length) collected.push(p) } catch {}
   // Every other tab.
   const gids = await listSheetGids(sheetId)
   for (const gid of gids) {
     if (String(gid) === String(preferredGid)) continue
-    try { const p = parseGviz(await fetchGvizJson(sheetId, gid)); if (p.rows.length) collected.push(p) } catch {}
+    try { const p = parse(await fetchGvizJson(sheetId, gid)); if (p.rows.length) collected.push(p) } catch {}
   }
   if (collected.length) return collected.sort((a, b) => b.rows.length - a.rows.length)[0]
   // Nothing yet — retry the whole flow (gviz frequently returns transient empties).
-  if (attempt < 3) { await sleep(400 * (attempt + 1)); return fetchSheetSmart(sheetId, preferredGid, attempt + 1) }
+  if (attempt < 3) { await sleep(400 * (attempt + 1)); return fetchSheetSmart(sheetId, preferredGid, headerRow, attempt + 1) }
   // Last resort: return the configured tab even if empty (keeps column metadata).
-  try { return parseGviz(await fetchGvizJson(sheetId, preferredGid)) } catch { return { columns: [], rows: [], rowCount: 0 } }
-}
-
-function parseGviz(g) {
-  const t = g.table || {}
-  const cols = (t.cols || []).map((c, i) => ({ id: c.id || `col${i}`, name: (c.label && c.label.trim()) || c.id || `Column ${i+1}`, type: c.type || 'string' }))
-  let rows = (t.rows || []).map(r => (r.c || []).map(c => c ? c.v : null))
-  const labelsEmpty = cols.every(c => !c.name || /^col\d+$|^Column \d+$/.test(c.name) || c.name === c.id)
-  if (labelsEmpty && rows.length > 0) {
-    const h = rows.shift()
-    h.forEach((v, i) => { if (v && cols[i]) cols[i].name = String(v) })
-  }
-  return { columns: cols, rows, rowCount: rows.length }
+  try { return parse(await fetchGvizJson(sheetId, preferredGid)) } catch { return { columns: [], rows: [], rowCount: 0 } }
 }
 
 const rowToObj = (cols, row, allowed) => {
@@ -392,11 +448,11 @@ async function getCachedOrLive(db, connector, source) {
   let columns = [], rows = []
   try {
     if (source.type === 'google_sheet') {
-      const p = await fetchSheetSmart(source.sheetId, source.gid)
+      const p = await fetchSheetSmart(source.sheetId, source.gid, connector.headerRow)
       columns = p.columns; rows = p.rows
     } else if (source.type === 'google_sheet_private') {
       const at = await getValidGoogleAccessToken(db, source.userId)
-      const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle)
+      const sd = await googleFetchSheetData(at, source.spreadsheetId, source.sheetTitle, connector.headerRow)
       columns = sd.columns; rows = sd.rows
     } else {
       columns = source.snapshot?.columns || []; rows = source.snapshot?.rows || []
@@ -511,21 +567,13 @@ async function googleSpreadsheetMeta(accessToken, spreadsheetId) {
   return data
 }
 
-async function googleFetchSheetData(accessToken, spreadsheetId, sheetTitle) {
+async function googleFetchSheetData(accessToken, spreadsheetId, sheetTitle, headerRow) {
   const range = sheetTitle ? `'${sheetTitle.replace(/'/g, "''")}'` : 'Sheet1'
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?valueRenderOption=UNFORMATTED_VALUE`
   const res = await fetch(url, { headers: { Authorization: 'Bearer ' + accessToken } })
   const data = await res.json()
   if (!res.ok) throw new Error('Sheets fetch failed: ' + (data.error?.message || 'unknown'))
-  const values = data.values || []
-  if (values.length === 0) return { columns: [], rows: [] }
-  const headerRow = values[0].map((h, i) => ({ id: `col${i}`, name: String(h ?? `Column ${i+1}`), type: 'string' }))
-  const rows = values.slice(1).map(r => {
-    const out = []
-    for (let i = 0; i < headerRow.length; i++) out.push(r[i] ?? null)
-    return out
-  })
-  return { columns: headerRow, rows }
+  return deriveColumnsAndRows(data.values || [], headerRow)
 }
 
 async function handler(request, { params }) {
@@ -794,6 +842,7 @@ async function handler(request, { params }) {
         name: b.name, department: b.department,
         sheetId: src.sheetId || null, gid: src.gid || '0',
         columns: b.columns || [], filter: b.filter || null, maskedColumns: b.maskedColumns || [],
+        headerRow: Number.isInteger(Number(b.headerRow)) && Number(b.headerRow) >= 1 ? Number(b.headerRow) : null,
         cacheMode: b.cacheMode || 'live', cacheTTLSeconds: b.cacheTTLSeconds || 300,
         token, status: 'active', revoked: false, callCount: 0, lastSyncAt: null,
         expiresAt: b.expiresAt || null,
@@ -821,8 +870,9 @@ async function handler(request, { params }) {
       }
       if (!sub && method === 'PATCH') {
         const b = await request.json()
-        const allowed = ['name','department','columns','filter','maskedColumns','cacheMode','cacheTTLSeconds','expiresAt']
+        const allowed = ['name','department','columns','filter','maskedColumns','cacheMode','cacheTTLSeconds','expiresAt','headerRow']
         const upd = {}; allowed.forEach(k => { if (k in b) upd[k] = b[k] })
+        if ('headerRow' in upd) upd.headerRow = (Number.isInteger(Number(upd.headerRow)) && Number(upd.headerRow) >= 1) ? Number(upd.headerRow) : null
         if (Object.keys(upd).length) await db.collection('connectors').updateOne({ id }, { $set: upd })
         await db.collection('cache').deleteOne({ tokenId: id })
         await logAct(db, u.id, 'connector_updated', { connectorId: id, fields: Object.keys(upd) })
