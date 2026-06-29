@@ -214,7 +214,12 @@ const rowToObj = (cols, row, allowed) => {
   const o = {}
   const isArr = Array.isArray(row)
   cols.forEach((c, i) => {
-    if (allowed && allowed.length && !allowed.includes(c.name)) return
+    // A column passes the whitelist if it matches by its current output name OR by
+    // its original spreadsheet letter/id. Saved whitelists predate the header fix
+    // and store column letters (A, B, …); without the letter/id match a column
+    // that gained a text header would silently drop out.
+    if (allowed && allowed.length &&
+        !(allowed.includes(c.name) || allowed.includes(c.letter) || allowed.includes(c.id))) return
     // Read the value by ORIGINAL position. For array rows that is the index; for
     // object rows (e.g. legacy/cached shapes keyed by column letter) fall back to
     // the letter/id. Output is always stored under the chosen key (c.name).
